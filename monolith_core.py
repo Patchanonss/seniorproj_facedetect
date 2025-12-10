@@ -12,6 +12,9 @@ from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1
 
 # --- EXTERNAL DEPENDENCIES ---
+# Optimize PyTorch CPU Threading
+torch.set_num_threads(4) # Limit to 4 threads to prevent fighting with Video loop
+
 # Ensure database.py is present in the directory
 try:
     import database as db
@@ -490,7 +493,7 @@ class AICameraSystem:
         self.registrar = RegistrationManager()
         
         # --- STANDARD SETUP ---
-        self.NUM_WORKERS = 5
+        self.NUM_WORKERS = 1  # Reduced from 5 to 1 to save CPU/GIL
         self.recognition_queue = queue.Queue(maxsize=10)
         self.known_faces = {}
         self.processing_ids = set()
@@ -610,11 +613,14 @@ class AICameraSystem:
 
     def _detection_loop(self):
         """
-        AI THREAD: Runs YOLO on CPU with resizing for speed.
+        AI THREAD: Runs YOLO with Safe Fallback (MPS -> CPU) and NO throttling.
         """
-        print("🧠 AI Detection Loop Started (CPU Optimized + Throttled)")
-        last_process_time = 0
+        print("🧠 AI Detection Loop Started (Speed Optimized)")
         
+        # FPS Counters
+        last_print_time = time.time()
+        frame_count = 0
+
         while self.running:
             try:
                 # 1. Get latest frame (Non-destructive)
@@ -622,17 +628,12 @@ class AICameraSystem:
                     time.sleep(0.1)
                     continue
                 
-                # THROTTLE: Cap AI at ~15 FPS to save CPU for Video Thread
-                if time.time() - last_process_time < 0.06:
-                    time.sleep(0.01)
-                    continue
-                    
+                # REMOVED THROTTLE: Run as fast as possible
+                
                 ret, frame = self.reader.read()
                 if not ret:
                     time.sleep(0.01)
                     continue
-                
-                last_process_time = time.time()
                 
                 # Flip once here for consistency
                 frame = cv2.flip(frame, 1)
@@ -640,8 +641,8 @@ class AICameraSystem:
                 h_orig, w_orig = frame.shape[:2]
                 
                 # --- OPTIMIZATION ---
-                # Run YOLO on smaller image (640px width) for speed on CPU
-                target_w = 640
+                # Run YOLO on smaller image (320px width) for speed on CPU
+                target_w = 320
                 scale = target_w / w_orig
                 target_h = int(h_orig * scale)
                 
@@ -649,10 +650,18 @@ class AICameraSystem:
 
                 # 2. Detect
                 if self.analyzer.tracker is not None:
-                    # Run on small frame
-                    results = self.analyzer.tracker.track(small_frame, verbose=False, conf=0.65, 
-                                                    persist=True, device='cpu')
-                    
+                    # REVERT TO CPU (Reliable)
+                    # We keep the "No Throttle" logic so it runs as fast as the CPU allows.
+                    try:
+                        results = self.analyzer.tracker.track(small_frame, verbose=False, conf=0.65, 
+                                                        persist=True, device='cpu')
+                    except Exception as e:
+                        print(f"❌ YOLO Error: {e}")
+                        results = None
+
+                    if not results:
+                        continue
+                        
                     display_boxes = []
                     if results and results[0].boxes:
                         # Get keypoints if available
@@ -664,7 +673,6 @@ class AICameraSystem:
                                 kpt_conf = keypoints.conf[i] 
                                 mean_conf = kpt_conf.mean()
                                 if mean_conf < 0.3:
-                                    # print(f"🚫 Ignored 'face' (Staircase?) due to low keypoint confidence: {mean_conf:.2f}")
                                     continue
                                 
                                 # --- BOX VALIDITY CHECK ---
@@ -682,22 +690,18 @@ class AICameraSystem:
                                 
                                 # 1. Aspect Ratio Filter
                                 if w > 0 and (h / w) > 3.5:
-                                    # print(f"🚫 Ignored 'Strip' Box: Ratio {h/w:.1f} too high. {w}x{h}")
                                     continue
                                     
                                 # 2. Geometric: Keypoints Center MUST be strictly inside the box
                                 kpts_xy = keypoints.xy[i].cpu().numpy()
                                 
-                                # kpts_xy are on small frame, scale them for checking?
-                                # Actually easier to check on small frame since box coords (sx1...) are also small
+                                # kpts_xy are on small frame
                                 k_cx_small = kpts_xy[:, 0].mean()
                                 k_cy_small = kpts_xy[:, 1].mean()
                                 
                                 if not (sx1 < k_cx_small < sx2 and sy1 < k_cy_small < sy2):
-                                    # print(f"🚫 Ignored 'Ghost': Keypoints outside box.")
                                     continue
 
-                                # print(f"✅ Approved Face: {mean_conf:.2f} Size: {w}x{h}")
                                 track_id = int(box.id.item()) if box.id is not None else None
                             
                             # Collect Keypoints for Drawing (OPTIONAL: Scale them up)
@@ -732,6 +736,14 @@ class AICameraSystem:
                                                 pass
                     
                     self.current_boxes = display_boxes
+            
+            # FPS CALCULATION
+                frame_count += 1
+                if time.time() - last_print_time > 2.0:
+                    fps = frame_count / (time.time() - last_print_time)
+                    print(f"📊 YOLO (CPU) FPS: {fps:.1f}")
+                    frame_count = 0
+                    last_print_time = time.time()
                     
             except Exception as e:
                 print(f"Detection Loop Error: {e}")
@@ -745,6 +757,10 @@ class AICameraSystem:
         CAMERA_INDEX = 1
         self.reader = VideoReader(src=CAMERA_INDEX, width=1280, height=720).start()
         time.sleep(1.0) # Warmup
+
+        # FPS Counters
+        last_print_time = time.time()
+        frame_count = 0
 
         while self.running:
             loop_start = time.time()
@@ -808,3 +824,11 @@ class AICameraSystem:
             wait = 0.033 - elapsed
             if wait > 0:
                 time.sleep(wait)
+
+            # FPS LOGGING
+            frame_count += 1
+            if time.time() - last_print_time > 2.0:
+                 fps = frame_count / (time.time() - last_print_time)
+                 print(f"🎥 Video FPS: {fps:.1f}")
+                 frame_count = 0
+                 last_print_time = time.time()
