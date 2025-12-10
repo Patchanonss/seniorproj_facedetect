@@ -1,0 +1,20 @@
+fastapi
+uvicorn
+python-multipart
+pandas
+openpyxl
+
+# --- THE PROTECTION LAYER (Crucial for Mac) ---
+# Fixes "Invalid Model" (TF 2.15 on Mac can't read files with h5py 3.10+)
+h5py==3.9.0
+# Fixes "Module compiled with NumPy 1.x" crash
+numpy==1.26.4
+# Fixes conflict with NumPy 2.0
+opencv-python==4.9.0.80
+
+# --- THE ENGINE ---
+# These must match exactly for GPU acceleration
+
+# --- AI MODELS ---
+deepface
+ultralytics
