@@ -819,9 +819,9 @@ class AICameraSystem:
             except Exception as e:
                 print(f"Display Loop Error: {e}")
             
-            # Maintain ~30 FPS
+            # Maintain 60 FPS
             elapsed = time.time() - loop_start
-            wait = 0.033 - elapsed
+            wait = 0.016 - elapsed
             if wait > 0:
                 time.sleep(wait)
 
