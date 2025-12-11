@@ -204,11 +204,12 @@ def get_full_semester_data():
             s.name, 
             ses.date,
             ses.topic,
+            ses.start_time,
             l.status
         FROM students s
         JOIN attendance_logs l ON s.id = l.student_id
         JOIN sessions ses ON l.session_id = ses.id
-        ORDER BY ses.date ASC, s.student_code ASC
+        ORDER BY ses.date ASC, ses.start_time ASC, s.student_code ASC
     '''
     rows = conn.execute(query).fetchall()
     conn.close()
@@ -224,7 +225,7 @@ def get_all_students():
 def get_all_sessions():
     """Need this to create the columns in Excel"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT topic, date FROM sessions WHERE is_active = 0 ORDER BY date ASC').fetchall()
+    rows = conn.execute('SELECT topic, date, start_time FROM sessions ORDER BY date ASC, start_time ASC').fetchall()
     conn.close()
     return [dict(row) for row in rows]
 # Init on load

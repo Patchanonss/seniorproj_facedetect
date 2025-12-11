@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import os
 import time
+import io
 
 # --- CUSTOM MODULES ---
 # import core_AI
@@ -166,6 +167,82 @@ def manual_attendance(update: ManualUpdate):
         raise HTTPException(status_code=404, detail="Student not found.")
 
     return {"message": f"Updated {update.student_name} to {update.status}"}
+    
+    
+# 4.5 EXPORT ENDPOINT
+# 4.5 EXPORT ENDPOINT
+@app.get("/export/attendance")
+def export_attendance():
+    import pandas as pd
+    from io import BytesIO
+    
+    # 1. Fetch ALL Data needed for the matrix
+    logs = db.get_full_semester_data()
+    all_students = db.get_all_students()
+    all_sessions = db.get_all_sessions()
+    
+    # 2. Prepare Lists for Keys
+    # Students
+    student_records = []
+    for s in all_students:
+        student_records.append({'student_code': s['student_code'], 'name': s['name']})
+    student_df = pd.DataFrame(student_records).drop_duplicates(subset=['student_code'])
+    
+    # Sessions
+    session_labels = []
+    for s in all_sessions:
+        # Use HH:MM to differentiate sessions on same day
+        time_str = s['start_time'][:5] if s['start_time'] else "00:00"
+        label = f"{s['date']} ({time_str}) - {s['topic']}"
+        session_labels.append(label)
+    # Deduplicate sessions just in case
+    session_labels = sorted(list(set(session_labels)))
+
+    # 3. Create Base DataFrame from Logs
+    if not logs:
+        # If no logs, create an empty frame with all students and sessions labeled ABSENT
+        # This is a bit complex, simpler to just make a DataFrame with NaN and fill
+        df = pd.DataFrame(columns=['student_code', 'name', 'session_label', 'status'])
+    else:
+        df = pd.DataFrame(logs)
+        # Apply same formatting
+        df['time_str'] = df['start_time'].apply(lambda x: x[:5] if x else "00:00")
+        df['session_label'] = df['date'] + " (" + df['time_str'] + ") - " + df['topic']
+    
+    # 4. Pivot
+    # Check if we have data to pivot
+    if not df.empty:
+        pivot_df = df.pivot_table(
+            index=['student_code', 'name'], 
+            columns='session_label', 
+            values='status', 
+            aggfunc='first'
+        )
+    else:
+        pivot_df = pd.DataFrame()
+
+    # 5. Enforce Structure (The "Right Join" logic)
+    # Reindex Index (Rows) -> All Students
+    # Create MultiIndex for students
+    if not student_df.empty:
+        student_index = pd.MultiIndex.from_frame(student_df[['student_code', 'name']])
+        pivot_df = pivot_df.reindex(index=student_index)
+    
+    # Reindex Columns -> All Sessions
+    if session_labels:
+        pivot_df = pivot_df.reindex(columns=session_labels)
+        
+    # 6. Fill Gaps
+    pivot_df = pivot_df.fillna('ABSENT')
+    
+    # 7. Export
+    stream = io.StringIO()
+    pivot_df.to_csv(stream)
+    
+    response = Response(content=stream.getvalue(), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=attendance_report.csv"
+    
+    return response
 
 
 # 5. REGISTRATION ENDPOINT (UPDATED FOR PYTORCH)

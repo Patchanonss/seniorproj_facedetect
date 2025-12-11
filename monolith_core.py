@@ -26,7 +26,7 @@ except ImportError:
 # Handles Neural Networks (YOLO + FaceNet)
 # ==========================================
 class FaceAnalyzer:
-    def __init__(self, model_path='yolov8n-face.pt'):
+    def __init__(self, model_path='yolov8n-face.mlpackage'):
         self.MODEL_PATH = model_path
         self.device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
         print(f"⚡ Loading FaceNet (PyTorch) on: {self.device}")
@@ -36,14 +36,15 @@ class FaceAnalyzer:
         self.recognizer.eval()
 
         print("🧠 Loading YOLO Models...")
-        # 1. TRACKER: For high-speed video loop (CPU)
-        self.tracker = YOLO(self.MODEL_PATH) if os.path.exists(self.MODEL_PATH) else YOLO('yolov8n.pt')
+        # 1. TRACKER: For high-speed video loop (CPU/CoreML)
+        # Note: task='pose' is explicitly set to ensure CoreML metadata is respected
+        self.tracker = YOLO(self.MODEL_PATH, task='pose') if os.path.exists(self.MODEL_PATH) else YOLO('yolov8n.pt')
         if os.path.exists(self.MODEL_PATH):
             print(f"✅ Success: Loaded Face Model ({self.MODEL_PATH})")
         else:
             print(f"⚠️ WARNING: '{self.MODEL_PATH}' not found! Loaded Standard YOLO (Objects) instead.")
         # 2. VALIDATOR: For quality checks & reloading (Separate instance to avoid locking)
-        self.validator = YOLO(self.MODEL_PATH) if os.path.exists(self.MODEL_PATH) else YOLO('yolov8n.pt')
+        self.validator = YOLO(self.MODEL_PATH, task='pose') if os.path.exists(self.MODEL_PATH) else YOLO('yolov8n.pt')
 
     def get_embedding(self, face_img):
         """
@@ -93,18 +94,21 @@ class FaceAnalyzer:
         
         # 1. BLUR CHECK
         blur_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        if blur_var < 200:  # Threshold for "Clear"
-            return False, "Image is too blurry. Please hold steady.", None
+        print(f"🔍 DEBUG: Blur Var: {blur_var:.2f}")
+        if blur_var < 50:  # Threshold for "Clear" (Relaxed further)
+            return False, f"Image is too blurry ({blur_var:.1f}). Please hold steady.", None
 
         # 2. RUN DETECTION (Use VALIDATOR)
         # We are in the API thread here, so we should use VALIDATOR to avoid race with TRACKER in detection thread
         results = self.validator.predict(img_bgr, verbose=False, conf=0.5, device='cpu')
         
         if not results or not results[0].boxes:
+            print("🔍 DEBUG: No face detected.")
             return False, "No face detected.", None
             
         boxes = results[0].boxes
         if len(boxes) > 1:
+            print(f"🔍 DEBUG: Faces found: {len(boxes)}")
             return False, "Multiple faces detected. Please be alone.", None
             
         # 3. EXTRACT FACE & KEYPOINTS
@@ -119,6 +123,7 @@ class FaceAnalyzer:
              # Check confidence
              if results[0].keypoints.conf is not None:
                  conf = results[0].keypoints.conf[0].cpu().numpy()
+                 print(f"🔍 DEBUG: Keypoint Conf: {conf.mean():.2f}")
                  if conf.mean() < 0.3:
                       return False, "Face not clear enough (low keypoint confidence).", None
 
@@ -130,7 +135,8 @@ class FaceAnalyzer:
                  dy = re[1] - le[1]
                  dx = re[0] - le[0]
                  angle = np.degrees(np.arctan2(dy, dx))
-                 if abs(angle) > 15:
+                 print(f"🔍 DEBUG: Head Tilt: {angle:.2f}")
+                 if abs(angle) > 25: # Relaxed from 15
                      return False, "Head tilted. Please keep head straight.", None
                      
                  # B. YAW (Turn) - Distance from Nose to Eyes
@@ -141,9 +147,10 @@ class FaceAnalyzer:
                  # Avoid division by zero
                  if dist_l_nose > 0 and dist_r_nose > 0:
                      ratio = max(dist_l_nose, dist_r_nose) / min(dist_l_nose, dist_r_nose)
+                     print(f"🔍 DEBUG: Turn Ratio: {ratio:.2f}")
                      # Frontal face should have ratio close to 1.0. 
                      # Side face will have large ratio.
-                     if ratio > 2.0: # Tunable
+                     if ratio > 4.0: # Relaxed from 2.0
                          return False, "Face turned. Please look straight at camera.", None
 
         return True, "Quality OK", face_crop
@@ -628,7 +635,8 @@ class AICameraSystem:
                     time.sleep(0.1)
                     continue
                 
-                # REMOVED THROTTLE: Run as fast as possible
+                # --- FPS CAP (30 FPS) ---
+                start_time = time.time()
                 
                 ret, frame = self.reader.read()
                 if not ret:
@@ -743,7 +751,13 @@ class AICameraSystem:
                     fps = frame_count / (time.time() - last_print_time)
                     print(f"📊 YOLO (CPU) FPS: {fps:.1f}")
                     frame_count = 0
+                    frame_count = 0
                     last_print_time = time.time()
+                
+                # Enforce FPS Cap (30 FPS = ~0.033s)
+                elapsed = time.time() - start_time
+                if elapsed < 0.033:
+                    time.sleep(0.033 - elapsed)
                     
             except Exception as e:
                 print(f"Detection Loop Error: {e}")
