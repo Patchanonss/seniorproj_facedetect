@@ -607,8 +607,14 @@ class AICameraSystem:
                 if self.active_session_id and name != "Unknown":
                     student = db.get_student_by_name(name)
                     if student:
-                        with self.db_lock:
-                            db.log_attendance(self.active_session_id, student['id'])
+                        # ENROLLMENT CHECK
+                        if not db.check_enrollment(student['id'], self.active_session_id):
+                             # Optional: Print only once per X seconds to avoid spam? 
+                             # For now, just print. The worker loop isn't too fast per face.
+                             print(f"⚠️ Student {name} recognized but NOT enrolled. Ignoring.")
+                        else:
+                            with self.db_lock:
+                                db.log_attendance(self.active_session_id, student['id'])
 
                 if track_id in self.processing_ids:
                     self.processing_ids.remove(track_id)

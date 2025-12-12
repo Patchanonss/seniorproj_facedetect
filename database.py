@@ -30,11 +30,13 @@ def init_db(gallery_path="gallery"):
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subject_id INTEGER,
         topic TEXT,
         date TEXT,
         start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         end_time TIMESTAMP,
-        is_active BOOLEAN DEFAULT 1
+        is_active BOOLEAN DEFAULT 1,
+        FOREIGN KEY (subject_id) REFERENCES subjects (id)
     )
     ''')
 
@@ -50,6 +52,27 @@ def init_db(gallery_path="gallery"):
         FOREIGN KEY (session_id) REFERENCES sessions (id),
         FOREIGN KEY (student_id) REFERENCES students (id),
         UNIQUE(session_id, student_id)
+    )
+    ''')
+    
+    # 4. SUBJECTS TABLE (NEW)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL
+    )
+    ''')
+    
+    # 5. ENROLLMENTS TABLE (NEW)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS enrollments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER,
+        subject_id INTEGER,
+        FOREIGN KEY (student_id) REFERENCES students (id),
+        FOREIGN KEY (subject_id) REFERENCES subjects (id),
+        UNIQUE(student_id, subject_id)
     )
     ''')
 
@@ -119,19 +142,82 @@ def get_student_by_name(name):
     return student
 
 
+# --- SUBJECT & ENROLLMENT FUNCTIONS ---
+
+def create_subject(code, name):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO subjects (code, name) VALUES (?, ?)', (code, name))
+        subject_id = cursor.lastrowid
+        conn.commit()
+        return subject_id
+    except sqlite3.IntegrityError:
+        # Return existing ID
+        row = conn.execute('SELECT id FROM subjects WHERE code = ?', (code,)).fetchone()
+        return row['id']
+    finally:
+        conn.close()
+
+def enroll_student(student_code, subject_code):
+    conn = get_db_connection()
+    try:
+        # Get IDs
+        stu = conn.execute('SELECT id FROM students WHERE student_code = ?', (student_code,)).fetchone()
+        sub = conn.execute('SELECT id FROM subjects WHERE code = ?', (subject_code,)).fetchone()
+        
+        if not stu or not sub:
+            return False, "Student or Subject not found"
+            
+        conn.execute('INSERT INTO enrollments (student_id, subject_id) VALUES (?, ?)', (stu['id'], sub['id']))
+        conn.commit()
+        return True, "Enrolled"
+    except sqlite3.IntegrityError:
+        return True, "Already Enrolled" # Idempotent
+    finally:
+        conn.close()
+
+def check_enrollment(student_id, session_id):
+    """
+    Checks if a student is enrolled in the subject of the given session.
+    If session has NO subject (Legacy/Open), returns True.
+    """
+    conn = get_db_connection()
+    
+    # 1. Get Session's Subject
+    session = conn.execute('SELECT subject_id FROM sessions WHERE id = ?', (session_id,)).fetchone()
+    if not session or not session['subject_id']:
+        conn.close()
+        return True # Open Session
+        
+    # 2. Check Enrollment
+    enrollment = conn.execute(
+        'SELECT 1 FROM enrollments WHERE student_id = ? AND subject_id = ?', 
+        (student_id, session['subject_id'])
+    ).fetchone()
+    
+    conn.close()
+    return True if enrollment else False
+
+
 # --- SESSION FUNCTIONS ---
 
-def create_session(topic=None):
+def create_session(topic=None, subject_code=None):
     conn = get_db_connection()
     now = datetime.datetime.now()
+    
+    subject_id = None
+    if subject_code:
+        # Auto-create subject if passing a code directly (Soft Launch)
+        subject_id = create_subject(subject_code, subject_code) 
 
     if not topic:
         topic = f"Class - {now.strftime('%Y-%m-%d')}"
 
     cursor = conn.cursor()
     cursor.execute(
-        'INSERT INTO sessions (topic, date, start_time, is_active) VALUES (?, ?, ?, 1)',
-        (topic, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'))
+        'INSERT INTO sessions (subject_id, topic, date, start_time, is_active) VALUES (?, ?, ?, ?, 1)',
+        (subject_id, topic, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'))
     )
     session_id = cursor.lastrowid
     conn.commit()

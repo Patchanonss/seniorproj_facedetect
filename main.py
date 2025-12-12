@@ -48,7 +48,15 @@ app.add_middleware(
 # --- DATA MODELS ---
 class ClassSession(BaseModel):
     topic: str
+    subject_code: str = None  # Optional for Soft Launch
 
+class SubjectPayload(BaseModel):
+    code: str
+    name: str
+
+class EnrollmentPayload(BaseModel):
+    student_code: str
+    subject_code: str
 
 class ManualUpdate(BaseModel):
     student_name: str
@@ -121,7 +129,8 @@ def capture_frame_endpoint():
 # 2. CONTROL THE CLASS
 @app.post("/start_class")
 def start_class(session: ClassSession):
-    session_id = db.create_session(session.topic)
+    # Pass subject_code to create strict session, or None for open/legacy
+    session_id = db.create_session(session.topic, session.subject_code)
     ai_system.active_session_id = session_id
     return {"message": "Class started", "session_id": session_id}
 
@@ -133,6 +142,21 @@ def end_class():
         db.close_session(current_session)
     ai_system.active_session_id = None
     return {"message": "Class ended"}
+    
+    
+# --- ENROLLMENT ENDPOINTS ---
+
+@app.post("/subjects")
+def create_subject(payload: SubjectPayload):
+    subject_id = db.create_subject(payload.code, payload.name)
+    return {"message": "Subject Created", "id": subject_id}
+
+@app.post("/enroll")
+def enroll_student(payload: EnrollmentPayload):
+    success, msg = db.enroll_student(payload.student_code, payload.subject_code)
+    if not success:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"message": msg}
 
 
 # 3. DATA FOR DASHBOARD
