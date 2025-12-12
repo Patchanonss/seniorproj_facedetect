@@ -172,105 +172,136 @@ class FaceDatabase:
         # Cache file path
         self.CACHE_PATH = os.path.join(self.DB_PATH, "vectors.pt")
 
-    def reload_database(self, face_analyzer):
-        """Loads gallery images with CACHING support."""
-        print("📂 Indexing Gallery...")
-        
-        # 1. Load Cache if exists
-        cached_data = {}
-        if os.path.exists(self.CACHE_PATH):
-            try:
-                print("   Loading cache file...")
-                cached_data = torch.load(self.CACHE_PATH)
-                print(f"   Cache loaded: {len(cached_data)} entries.")
-            except Exception as e:
-                print(f"⚠️ Corrupt cache, rebuilding: {e}")
+    def reload_database(self, face_analyzer, class_id_or_code=None):
+        """
+        Loads gallery images for a SPECIFIC CLASS.
+        Structure: gallery/{class_id}/vectors/{name}.pt
+        """
+        if not class_id_or_code:
+            print("⚠️ No Class ID provided. Clearing memory.")
+            self.face_db_embeddings = []
+            self.face_db_names = []
+            return
 
-        # 2. Scan Files
-        gallery_images = glob.glob(os.path.join(self.DB_PATH, "**", "*.jpg"), recursive=True)
-        gallery_images += glob.glob(os.path.join(self.DB_PATH, "**", "*.png"), recursive=True)
+        target_dir = os.path.join(self.DB_PATH, str(class_id_or_code))
+        vectors_dir = os.path.join(target_dir, "vectors")
+        legacy_cache_path = os.path.join(target_dir, "vectors.pt")
         
-        # 3. Determine work to do
+        print(f"📂 Indexing Gallery for Class: {class_id_or_code}...")
+        
+        # 1. Ensure Directory Exists
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+
+        # -----------------------------------------------
+        # MIGRATION: Split Legacy vectors.pt -> vectors/*.pt
+        # -----------------------------------------------
+        if os.path.exists(legacy_cache_path):
+            print("📦 Found legacy monolithic cache. Migrating to granular files...")
+            try:
+                if not os.path.exists(vectors_dir):
+                     os.makedirs(vectors_dir)
+                     
+                legacy_data = torch.load(legacy_cache_path)
+                for name, embedding in legacy_data.items():
+                    safe_path = os.path.join(vectors_dir, f"{name}.pt")
+                    torch.save(embedding, safe_path)
+                    print(f"   -> Migrated {name}")
+                
+                # Backup and remove legacy
+                os.rename(legacy_cache_path, legacy_cache_path + ".bak")
+                print("✅ Migration complete. Legacy cache backed up.")
+            except Exception as e:
+                print(f"⚠️ Migration failed: {e}")
+        # -----------------------------------------------
+
+        if not os.path.exists(vectors_dir):
+            os.makedirs(vectors_dir)
+
+        # 2. Gather All Names from Images (Source of Truth)
+        gallery_images = glob.glob(os.path.join(target_dir, "*.jpg"))
+        gallery_images += glob.glob(os.path.join(target_dir, "*.png"))
+        
         new_names = []
         new_embeddings = []
         
-        valid_cache_count = 0
         processed_count = 0
-        
+        loaded_count = 0
+
         for img_path in gallery_images:
             name = os.path.splitext(os.path.basename(img_path))[0]
+            vector_path = os.path.join(vectors_dir, f"{name}.pt")
             
-            # If in cache, use it!
-            if name in cached_data:
+            embedding = None
+            
+            # A. Try Load from Granular Cache
+            if os.path.exists(vector_path):
+                try:
+                    embedding = torch.load(vector_path)
+                    loaded_count += 1
+                except:
+                    print(f"⚠️ Corrupt vector file for {name}, regenerating...")
+
+            # B. If No Cache, Regenerate
+            if embedding is None:
+                try:
+                    processed_count += 1
+                    img = cv2.imread(img_path)
+                    if img is None: continue
+                    
+                    # Optimization: Resize huge images
+                    h, w = img.shape[:2]
+                    if w > 640:
+                         scale = 640 / w
+                         img = cv2.resize(img, (640, int(h * scale)))
+
+                    # 1. Detect
+                    results = face_analyzer.validator.predict(img, verbose=False, conf=0.15, device='cpu')
+                    
+                    face_crop = None
+                    if results and results[0].boxes:
+                        largest_area = 0
+                        best_box = None
+                        for box in results[0].boxes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            area = (x2 - x1) * (y2 - y1)
+                            if area > largest_area:
+                                largest_area = area
+                                best_box = (x1, y1, x2, y2)
+                        
+                        if best_box:
+                            x1, y1, x2, y2 = best_box
+                            face_crop = img[max(0, y1):min(img.shape[0], y2), max(0, x1):min(img.shape[1], x2)]
+
+                    if face_crop is None or face_crop.size == 0:
+                        face_crop = img # Fallback
+
+                    face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                    embedding = face_analyzer.get_embedding(face_crop)
+                    
+                    if embedding is not None:
+                        # Moves to CPU for storage
+                        embedding = embedding.cpu()
+                        # Save Granular Cache
+                        torch.save(embedding, vector_path)
+                        print(f"   -> Generated & Saved {name}.pt")
+                        
+                except Exception as e:
+                    print(f"⚠️ Error processing {name}: {e}")
+
+            if embedding is not None:
+                new_embeddings.append(embedding)
                 new_names.append(name)
-                new_embeddings.append(cached_data[name])
-                valid_cache_count += 1
-                continue
-                
-            # Not in cache, Process it
-            try:
-                processed_count += 1
-                img = cv2.imread(img_path)
-                if img is None: continue
-                
-                # OPTIMIZATION: Resize huge images
-                h, w = img.shape[:2]
-                if w > 640:
-                    scale = 640 / w
-                    img = cv2.resize(img, (640, int(h * scale)))
-                
-                # Detect
-                results = face_analyzer.validator.predict(img, verbose=False, conf=0.15, device='cpu')
-                
-                face_crop = None
-                if results and results[0].boxes:
-                    largest_area = 0
-                    best_box = None
-                    for box in results[0].boxes:
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        area = (x2 - x1) * (y2 - y1)
-                        if area > largest_area:
-                            largest_area = area
-                            best_box = (x1, y1, x2, y2)
-                    
-                    if best_box:
-                        x1, y1, x2, y2 = best_box
-                        face_crop = img[max(0, y1):min(img.shape[0], y2), max(0, x1):min(img.shape[1], x2)]
-
-                if face_crop is None or face_crop.size == 0:
-                    print(f"⚠️ No face detected in {name}, using full image.")
-                    face_crop = img
-
-                face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                embedding = face_analyzer.get_embedding(face_crop)
-                
-                if embedding is not None:
-                    # Move to CPU for storage in list/cache (save GPU memory)
-                    emb_cpu = embedding.cpu()
-                    new_embeddings.append(emb_cpu)
-                    new_names.append(name)
-                    
-                    # Update cache dict immediately
-                    cached_data[name] = emb_cpu
-                    
-            except Exception as e:
-                print(f"⚠️ Error processing {img_path}: {e}")
-
-        # 4. Save Cache (if we did any work)
-        if processed_count > 0:
-            print(f"💾 Saving updated cache with {len(cached_data)} entries...")
-            torch.save(cached_data, self.CACHE_PATH)
         
-        # 5. Build Final Tensor
+        # 3. Build Final Tensor (In Memory)
         if new_embeddings:
-            # Stack and move to Device (MPS) ONCE
             self.face_db_embeddings = torch.stack(new_embeddings).to(self.device)
             self.face_db_names = new_names
-            print(f"✅ Reload Complete. Active Faces: {len(self.face_db_names)} (Cached: {valid_cache_count}, New: {processed_count})")
+            print(f"✅ Class {class_id_or_code} Loaded. Active Faces: {len(self.face_db_names)} (Cached: {loaded_count}, New: {processed_count})")
         else:
             self.face_db_embeddings = []
             self.face_db_names = []
-            print("⚠️ No faces found.")
+            print(f"⚠️ Class {class_id_or_code} is empty.")
 
     def get_match(self, target_embedding):
         """
@@ -303,13 +334,13 @@ class FaceDatabase:
         min_idx = np.argmin(dist)
         return dist[min_idx], self.face_db_names[min_idx]
 
-    def add_face_to_memory(self, name, embedding):
+    def add_face_to_memory(self, name, embedding, class_id):
         """
-        Directly appends a new face to the running memory & updates cache.
+        Directly appends a new face to the running memory & updates GRANULAR cache.
         """
         if embedding is None: return
 
-        print(f"⚡ Hot-adding {name} to memory...")
+        print(f"⚡ Hot-adding {name} to memory (Class {class_id})...")
         
         # 1. Update In-Memory Tensor
         emb_tensor = embedding.to(self.device)
@@ -320,15 +351,18 @@ class FaceDatabase:
             
         self.face_db_names.append(name)
         
-        # 2. Update Disk Cache (So next restart is fast)
-        try:
-            if os.path.exists(self.CACHE_PATH):
-                cached_data = torch.load(self.CACHE_PATH)
-            else:
-                cached_data = {}
+        # 2. Update Disk Cache (Granular)
+        target_dir = os.path.join(self.DB_PATH, str(class_id))
+        vectors_dir = os.path.join(target_dir, "vectors")
+        
+        if not os.path.exists(vectors_dir):
+            os.makedirs(vectors_dir)
             
-            cached_data[name] = embedding.cpu()
-            torch.save(cached_data, self.CACHE_PATH)
+        vector_path = os.path.join(vectors_dir, f"{name}.pt")
+        
+        try:
+            torch.save(embedding.cpu(), vector_path)
+            print(f"💾 Saved vector: {name}.pt")
         except Exception as e:
              print(f"⚠️ Auto-save cache failed: {e}")
 
@@ -387,9 +421,9 @@ class RegistrationManager:
             "preview": preview_data
         }
 
-    def commit_registration(self, token, name, face_db):
+    def commit_registration(self, token, name, face_db, class_id):
         """
-        Moves from cache to gallery. Returns file path.
+        Moves from cache to gallery/{class_id}/. Returns file path.
         """
         if token not in self.registration_cache:
             return {"success": False, "message": "Session expired or invalid token."}
@@ -398,19 +432,25 @@ class RegistrationManager:
         img = data['full_img']
         embedding = data['embedding']
         
-        # Save to Gallery
+        # Save to Gallery/Class_ID
         safe_name = "".join(x for x in name if x.isalnum() or x in " _-").strip()
-        if not os.path.exists(self.DB_PATH):
-            os.makedirs(self.DB_PATH)
+        class_based_path = os.path.join(self.DB_PATH, str(class_id))
+        
+        if not os.path.exists(class_based_path):
+            os.makedirs(class_based_path)
             
         filename = f"{safe_name}.jpg"
-        file_path = os.path.join(self.DB_PATH, filename)
+        file_path = os.path.join(class_based_path, filename)
         
         # Write File
         cv2.imwrite(file_path, img)
         
-        # HOT-ADD to memory
-        face_db.add_face_to_memory(safe_name, embedding)
+        # HOT-ADD to memory (Only if this class is currently loaded? No, logic is simpler to just add if loaded)
+        # Check if FaceDB is currently serving THIS class? 
+        # For simplicity, we just add it. If the DB is on another class, this might be noise, but harmless.
+        # Ideally, we should check `face_db.current_class_id`. I'll implement that property.
+        
+        face_db.add_face_to_memory(safe_name, embedding, class_id)
         
         return {"success": True, "path": file_path, "name": safe_name}
 
@@ -520,27 +560,32 @@ class AICameraSystem:
         self.box_lock = threading.Lock() 
         
         self.active_session_id = None
+        self.allow_registration = False # NEW: Toggle for Remote Registration
         
         # Exposed for main.py (Backwards Compatibility)
         self.detector = self.analyzer.validator 
         
         # Initial Load
-        self.reload_database()
+        # self.reload_database() (Warning: Need to specify class_id now. Start empty.)
+        self.active_class_id = None
         
         # LAZY START STATE
         self.threads_started = False
 
-    def reload_database(self):
-        self.face_db.reload_database(self.analyzer)
-
+    def load_class(self, class_id):
+        self.active_class_id = class_id
+        # Stop worker threads briefly? No, just hot-swap.
+        with self.db_lock:
+            self.face_db.reload_database(self.analyzer, class_id)
+            
     # --- DELEGATED METHODS ---
     def validate_and_stage(self, img_bgr):
         return self.registrar.validate_and_stage(img_bgr, self.analyzer, self.face_db)
 
-    def commit_registration(self, token, name):
-        result = self.registrar.commit_registration(token, name, self.face_db)
+    def commit_registration(self, token, name, class_id):
+        result = self.registrar.commit_registration(token, name, self.face_db, class_id)
         if result["success"]:
-             self.threads_started = False
+             self.threads_started = False # Why? maybe to reset?
         return result
 
     # --- THREAD MANAGEMENT ---

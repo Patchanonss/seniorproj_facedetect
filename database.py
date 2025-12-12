@@ -11,11 +11,23 @@ def get_db_connection():
     return conn
 
 
+
 def init_db(gallery_path="gallery"):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. STUDENTS TABLE
+    # 1. PROFESSORS TABLE (NEW)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS professors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
+    # 2. STUDENTS TABLE
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,45 +38,52 @@ def init_db(gallery_path="gallery"):
     )
     ''')
 
-    # 2. SESSIONS TABLE
+    # 3. SUBJECTS TABLE (NEW/MODIFIED)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS subjects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        professor_id INTEGER,
+        FOREIGN KEY (professor_id) REFERENCES professors (id)
+    )
+    ''')
+
+    # 4. SESSIONS TABLE (MODIFIED)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         subject_id INTEGER,
+        professor_id INTEGER,
         topic TEXT,
+        room TEXT,
         date TEXT,
         start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         end_time TIMESTAMP,
         is_active BOOLEAN DEFAULT 1,
-        FOREIGN KEY (subject_id) REFERENCES subjects (id)
+        FOREIGN KEY (subject_id) REFERENCES subjects (id),
+        FOREIGN KEY (professor_id) REFERENCES professors (id)
     )
     ''')
 
-    # 3. ATTENDANCE LOGS
+    # 5. ATTENDANCE LOGS (MODIFIED)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS attendance_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER,
         student_id INTEGER,
+        professor_id INTEGER,
         check_in_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         status TEXT,
         is_manual BOOLEAN DEFAULT 0,
         FOREIGN KEY (session_id) REFERENCES sessions (id),
         FOREIGN KEY (student_id) REFERENCES students (id),
+        FOREIGN KEY (professor_id) REFERENCES professors (id),
         UNIQUE(session_id, student_id)
     )
     ''')
     
-    # 4. SUBJECTS TABLE (NEW)
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS subjects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        code TEXT UNIQUE NOT NULL,
-        name TEXT NOT NULL
-    )
-    ''')
-    
-    # 5. ENROLLMENTS TABLE (NEW)
+    # 6. ENROLLMENTS TABLE
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS enrollments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,8 +94,6 @@ def init_db(gallery_path="gallery"):
         UNIQUE(student_id, subject_id)
     )
     ''')
-
-    conn.commit()
     conn.close()
     print("✅ Database Initialized!")
 
@@ -115,13 +132,45 @@ def sync_gallery_to_db(gallery_path):
         print(f"🔄 Auto-Synced {count} students from Gallery.")
     conn.close()
 
+# --- PROFESSOR FUNCTIONS (NEW) ---
+
+def create_professor(username, password_hash, full_name):
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'INSERT INTO professors (username, password_hash, full_name) VALUES (?, ?, ?)',
+            (username, password_hash, full_name)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def get_professor_by_username(username):
+    conn = get_db_connection()
+    prof = conn.execute('SELECT * FROM professors WHERE username = ?', (username,)).fetchone()
+    conn.close()
+    return prof
+
+def get_professor_by_id(prof_id):
+    conn = get_db_connection()
+    prof = conn.execute('SELECT * FROM professors WHERE id = ?', (prof_id,)).fetchone()
+    conn.close()
+    return prof
+
 
 # --- STUDENT FUNCTIONS ---
 
 def add_student(student_code, name, image_path):
-    """Used by the Registration Page"""
+    """
+    Used by the Registration Page.
+    Handles Multi-Class Registration by allowing existing students.
+    """
     conn = get_db_connection()
     try:
+        # Try to Insert
         conn.execute(
             'INSERT INTO students (student_code, name, image_path) VALUES (?, ?, ?)',
             (student_code, name, image_path)
@@ -129,8 +178,11 @@ def add_student(student_code, name, image_path):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        print(f"⚠️ Student {student_code} already exists.")
-        return False
+        # Student exists. This is expected for multi-class enrollment.
+        # We might want to update the image path or name?
+        # For now, just return True so flow continues to Enrollment.
+        print(f"ℹ️ Student {student_code} already in DB. Proceeding to enrollment.")
+        return True
     finally:
         conn.close()
 
@@ -159,21 +211,27 @@ def create_subject(code, name):
     finally:
         conn.close()
 
-def enroll_student(student_code, subject_code):
+def enroll_student(student_code, subject_code=None, subject_id=None):
     conn = get_db_connection()
     try:
-        # Get IDs
+        # Get Student
         stu = conn.execute('SELECT id FROM students WHERE student_code = ?', (student_code,)).fetchone()
-        sub = conn.execute('SELECT id FROM subjects WHERE code = ?', (subject_code,)).fetchone()
+        if not stu: return False, "Student not found"
         
-        if not stu or not sub:
-            return False, "Student or Subject not found"
+        # Get Subject
+        sid = subject_id
+        if not sid and subject_code:
+            sub = conn.execute('SELECT id FROM subjects WHERE code = ?', (subject_code,)).fetchone()
+            if sub: sid = sub['id']
             
-        conn.execute('INSERT INTO enrollments (student_id, subject_id) VALUES (?, ?)', (stu['id'], sub['id']))
+        if not sid:
+            return False, "Subject not found"
+            
+        conn.execute('INSERT INTO enrollments (student_id, subject_id) VALUES (?, ?)', (stu['id'], sid))
         conn.commit()
         return True, "Enrolled"
     except sqlite3.IntegrityError:
-        return True, "Already Enrolled" # Idempotent
+        return True, "Already Enrolled"
     finally:
         conn.close()
 
@@ -202,22 +260,24 @@ def check_enrollment(student_id, session_id):
 
 # --- SESSION FUNCTIONS ---
 
-def create_session(topic=None, subject_code=None):
+def create_session(topic=None, subject_code=None, professor_id=None, room=None):
     conn = get_db_connection()
     now = datetime.datetime.now()
     
     subject_id = None
     if subject_code:
         # Auto-create subject if passing a code directly (Soft Launch)
+        # TODO: Assign professor_id to subject too if new?
         subject_id = create_subject(subject_code, subject_code) 
+        # Update subject owner if not set? Skip for now.
 
     if not topic:
         topic = f"Class - {now.strftime('%Y-%m-%d')}"
 
     cursor = conn.cursor()
     cursor.execute(
-        'INSERT INTO sessions (subject_id, topic, date, start_time, is_active) VALUES (?, ?, ?, ?, 1)',
-        (subject_id, topic, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'))
+        'INSERT INTO sessions (subject_id, professor_id, topic, room, date, start_time, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
+        (subject_id, professor_id, topic, room, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'))
     )
     session_id = cursor.lastrowid
     conn.commit()
@@ -291,7 +351,10 @@ def get_full_semester_data():
             ses.date,
             ses.topic,
             ses.start_time,
-            l.status
+            CASE 
+                WHEN l.is_manual = 1 THEN l.status || ' (Manual)'
+                ELSE l.status 
+            END as status
         FROM students s
         JOIN attendance_logs l ON s.id = l.student_id
         JOIN sessions ses ON l.session_id = ses.id
@@ -314,5 +377,49 @@ def get_all_sessions():
     rows = conn.execute('SELECT topic, date, start_time FROM sessions ORDER BY date ASC, start_time ASC').fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+def get_live_monitor_data(session_id):
+    """
+    Returns a list of ALL enrolled students for the session's subject.
+    Status is 'PRESENT' if they have a log in this session, otherwise 'ABSENT'.
+    """
+    conn = get_db_connection()
+    
+    # 1. Get Subject ID from Session
+    sess = conn.execute('SELECT subject_id, professor_id, topic, room, start_time FROM sessions WHERE id = ?', (session_id,)).fetchone()
+    if not sess:
+        conn.close()
+        return None
+        
+    subject_id = sess['subject_id']
+    
+    # 2. Get All Enrolled Students + Left Join with Logs
+    query = '''
+        SELECT 
+            s.student_code,
+            s.name,
+            s.image_path,
+            l.check_in_time,
+            CASE 
+                WHEN l.status IS NOT NULL THEN l.status
+                ELSE 'ABSENT' 
+            END as status
+        FROM enrollments e
+        JOIN students s ON e.student_id = s.id
+        LEFT JOIN attendance_logs l ON l.student_id = s.id AND l.session_id = ?
+        WHERE e.subject_id = ?
+        ORDER BY s.student_code ASC
+    '''
+    
+    rows = conn.execute(query, (session_id, subject_id)).fetchall()
+    conn.close()
+    
+    students = [dict(row) for row in rows]
+    
+    return {
+        "session_info": dict(sess),
+        "students": students
+    }
+
 # Init on load
 init_db()

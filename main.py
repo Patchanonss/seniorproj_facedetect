@@ -13,6 +13,7 @@ import io
 # import core_AI
 import database as db
 import monolith_core
+import auth
 
 # --- GLOBAL INSTANCE ---
 # This initializes the PyTorch-based AI system
@@ -38,7 +39,8 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Allow any origin (localhost, 192.168.x.x, etc.)
+    allow_origin_regex=r"http://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,7 +50,8 @@ app.add_middleware(
 # --- DATA MODELS ---
 class ClassSession(BaseModel):
     topic: str
-    subject_code: str = None  # Optional for Soft Launch
+    subject_code: str = None  # Optional for legacy/soft
+    room: str = "Default Room" # NEW
 
 class SubjectPayload(BaseModel):
     code: str
@@ -58,15 +61,24 @@ class EnrollmentPayload(BaseModel):
     student_code: str
     subject_code: str
 
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class UserRegister(BaseModel):
+    username: str
+    password: str
+    full_name: str
+
 class ManualUpdate(BaseModel):
     student_name: str
     status: str  # "PRESENT", "LATE", "ABSENT"
-
 
 class ConfirmPayload(BaseModel):
     token: str
     name: str
     student_code: str
+    class_id: int # NEW
 
 
 # --- ROUTES ---
@@ -74,6 +86,29 @@ class ConfirmPayload(BaseModel):
 @app.get("/")
 def read_root():
     return {"status": "System is running"}
+
+
+# --- AUTH ROUTES ---
+@app.post("/auth/register")
+def register(user: UserRegister):
+    hashed_pw = auth.get_password_hash(user.password)
+    success = db.create_professor(user.username, hashed_pw, user.full_name)
+    if not success:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    return {"message": "User created successfully"}
+
+@app.post("/auth/login")
+def login(user: UserLogin):
+    prof = db.get_professor_by_username(user.username)
+    if not prof or not auth.verify_password(user.password, prof['password_hash']):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    access_token = auth.create_access_token(data={"sub": prof['username']})
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": prof['id'], "name": prof['full_name']}}
+
+@app.get("/auth/me")
+def read_users_me(current_user: dict = auth.Depends(auth.get_current_user)):
+    return {"username": current_user['username'], "full_name": current_user['full_name'], "id": current_user['id']}
 
 
 # 1. THE VIDEO STREAM
@@ -123,14 +158,45 @@ def capture_frame_endpoint():
         
     if ai_system.current_clean_jpeg:
         return Response(content=ai_system.current_clean_jpeg, media_type="image/jpeg")
-    return Response(status_code=503, content="Camera initializing...")
+    
+    # Return placeholder if no frame yet
+    return Response(content=b"", media_type="image/jpeg")
+
+@app.get("/session/monitor")
+def get_monitor_data(session_id: int):
+    # This endpoint is PUBLIC (or maybe protected by token, but kept simple for now)
+    # Allows separate browser to view status.
+    data = db.get_live_monitor_data(session_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return data
 
 
 # 2. CONTROL THE CLASS
+# 2. CONTROL THE CLASS
 @app.post("/start_class")
-def start_class(session: ClassSession):
-    # Pass subject_code to create strict session, or None for open/legacy
-    session_id = db.create_session(session.topic, session.subject_code)
+def start_class(session: ClassSession, current_user: dict = auth.Depends(auth.get_current_user)):
+    # 1. Determine Subject ID (Create if needed)
+    subject_id = None
+    if session.subject_code:
+        subject_id = db.create_subject(session.subject_code, session.subject_code) # Lazy create name=code
+        
+    # 2. Create Session linked to Professor
+    session_id = db.create_session(
+        topic=session.topic, 
+        subject_code=session.subject_code, 
+        professor_id=current_user['id'], 
+        room=session.room
+    )
+    
+    # 3. Load AI Class
+    if subject_id:
+        print(f"🔄 Switching AI to Class ID: {subject_id}")
+        ai_system.load_class(subject_id)
+    else:
+        print("⚠️ Starting Legacy/Open Session (No Class Isolation)")
+        ai_system.load_class("legacy")
+
     ai_system.active_session_id = session_id
     return {"message": "Class started", "session_id": session_id}
 
@@ -143,13 +209,52 @@ def end_class():
     ai_system.active_session_id = None
     return {"message": "Class ended"}
     
+@app.post("/session/toggle_registration")
+def toggle_registration(enable: bool):
+    ai_system.allow_registration = enable
+    status = "Enabled" if enable else "Disabled"
+    print(f"🔓 Registration {status}")
+    return {"message": f"Registration {status}", "enabled": enable}
+
+@app.get("/session/registration_status")
+def get_registration_status():
+    return {"enabled": ai_system.allow_registration}
     
-# --- ENROLLMENT ENDPOINTS ---
+    
+# --- SUBJECT MANAGEMENT ---
+
+@app.get("/subjects")
+def get_subjects(current_user: dict = auth.Depends(auth.get_current_user)):
+    conn = db.get_db_connection()
+    # TODO: Filter by professor_id once DB schema fully mandates ownership
+    # For now, list all or just owned? Let's try listing all for MVP simplicity
+    # but ideally: WHERE professor_id = ?
+    # Currently DB.create_subject doesn't take professor_id yet? Let's check DB schema.
+    # Schema HAS professor_id.
+    rows = conn.execute('SELECT * FROM subjects').fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 @app.post("/subjects")
-def create_subject(payload: SubjectPayload):
-    subject_id = db.create_subject(payload.code, payload.name)
-    return {"message": "Subject Created", "id": subject_id}
+def create_subject_endpoint(payload: SubjectPayload, current_user: dict = auth.Depends(auth.get_current_user)):
+    # Used by Manage Classes page
+    conn = db.get_db_connection()
+    try:
+        # Check if code exists
+        exist = conn.execute('SELECT id FROM subjects WHERE code = ?', (payload.code,)).fetchone()
+        if exist:
+             raise HTTPException(status_code=400, detail="Subject code already exists")
+        
+        conn.execute(
+            'INSERT INTO subjects (code, name, professor_id) VALUES (?, ?, ?)',
+            (payload.code, payload.name, current_user['id'])
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+    conn.close()
+    return {"message": "Subject created"}
 
 @app.post("/enroll")
 def enroll_student(payload: EnrollmentPayload):
@@ -326,6 +431,10 @@ async def register_validate(file: UploadFile = File(...)):
     """
     Step 1: Upload photo. check quality. get token + preview.
     """
+    # 0. Check Gate
+    if not ai_system.allow_registration:
+        raise HTTPException(status_code=403, detail="Registration is currently closed by the Professor.")
+
     try:
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
@@ -346,7 +455,8 @@ async def register_confirm(payload: ConfirmPayload, background_tasks: Background
     """
     Step 2: Commit payload. using token.
     """
-    res = ai_system.commit_registration(payload.token, payload.name)
+    # Fix: User AI system's logical commit
+    res = ai_system.commit_registration(payload.token, payload.name, payload.class_id)
     
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
@@ -355,17 +465,12 @@ async def register_confirm(payload: ConfirmPayload, background_tasks: Background
     safe_name = res["name"]
     
     # Write to DB
+    # Note: DB add_student is global. Student table is global.
+    # This is fine. Enrollments handle class membership.
     success = db.add_student(payload.student_code, safe_name, file_path)
     
-    if not success:
-        # Cleanup
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=400, detail="Student ID already exists.")
-        
-        raise HTTPException(status_code=400, detail="Student ID already exists.")
-        
-    # No need to reload whole DB, we Hot-Added it in memory!
-    print(f"✅ Student {safe_name} committed to DB and Memory.")
+    # AUTO ENROLL TO CLASS
+    # payload.class_id is the database ID (int), so we pass it as subject_id
+    db.enroll_student(payload.student_code, subject_id=payload.class_id)
     
     return {"status": "success", "message": f"Student {safe_name} registered successfully!"}
