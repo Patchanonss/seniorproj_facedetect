@@ -76,10 +76,25 @@ def init_db(gallery_path="gallery"):
         check_in_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         status TEXT,
         is_manual BOOLEAN DEFAULT 0,
+        proof_path TEXT,
         FOREIGN KEY (session_id) REFERENCES sessions (id),
         FOREIGN KEY (student_id) REFERENCES students (id),
         FOREIGN KEY (professor_id) REFERENCES professors (id),
-        UNIQUE(session_id, student_id)
+    UNIQUE(session_id, student_id)
+    )
+    ''')
+    
+    # 5.5 RAW FACE LOGS (For "Store Everything" Requirement)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS raw_face_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER,
+        student_id INTEGER,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        confidence REAL,
+        proof_path TEXT,
+        FOREIGN KEY (session_id) REFERENCES sessions (id),
+        FOREIGN KEY (student_id) REFERENCES students (id)
     )
     ''')
     
@@ -193,14 +208,44 @@ def get_student_by_name(name):
     conn.close()
     return student
 
+def get_student_for_session(name, session_id):
+    """
+    Finds a student by name who is enrolled in the CURRENT session's subject.
+    Resolves ambiguity if multiple students have the same name (e.g. multi-class enrollment duplicates).
+    """
+    conn = get_db_connection()
+    try:
+        # 1. Get Session Subject
+        session = conn.execute('SELECT subject_id FROM sessions WHERE id = ?', (session_id,)).fetchone()
+        if not session: return None
+        
+        subject_id = session['subject_id']
+        
+        # 2. Find Student with Name AND Enrollment in Subject
+        query = '''
+            SELECT s.* 
+            FROM students s
+            JOIN enrollments e ON s.id = e.student_id
+            WHERE s.name = ? AND e.subject_id = ?
+        '''
+        student = conn.execute(query, (name, subject_id)).fetchone()
+        
+        # Fallback: If not found enrolled, just get any student with that name (will likely fail enrollment check later, but safe)
+        if not student:
+            student = conn.execute('SELECT * FROM students WHERE name = ?', (name,)).fetchone()
+            
+        return student
+    finally:
+        conn.close()
+
 
 # --- SUBJECT & ENROLLMENT FUNCTIONS ---
 
-def create_subject(code, name):
+def create_subject(code, name, professor_id=None):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('INSERT INTO subjects (code, name) VALUES (?, ?)', (code, name))
+        cursor.execute('INSERT INTO subjects (code, name, professor_id) VALUES (?, ?, ?)', (code, name, professor_id))
         subject_id = cursor.lastrowid
         conn.commit()
         return subject_id
@@ -307,18 +352,81 @@ def close_session(session_id):
 
 # --- LOGGING FUNCTIONS ---
 
-def log_attendance(session_id, student_id, status="PRESENT"):
+def log_raw_face(session_id, student_id, confidence, proof_path=None):
+    """
+    Logs EVERY face detection event. No unique constraint.
+    """
     conn = get_db_connection()
     try:
         conn.execute(
-            'INSERT INTO attendance_logs (session_id, student_id, status) VALUES (?, ?, ?)',
-            (session_id, student_id, status)
+            'INSERT INTO raw_face_logs (session_id, student_id, confidence, proof_path) VALUES (?, ?, ?, ?)',
+            (session_id, student_id, confidence, proof_path)
         )
         conn.commit()
-        print(f"✅ Logged Student ID {student_id}")
+    except Exception as e:
+        print(f"⚠️ Failed to log raw face: {e}")
+    finally:
+        conn.close()
+
+def log_attendance(session_id, student_id, status="PRESENT", proof_path=None):
+    conn = get_db_connection()
+    try:
+        # 1. Get Professor ID from Session
+        session = conn.execute('SELECT professor_id FROM sessions WHERE id = ?', (session_id,)).fetchone()
+        prof_id = session['professor_id'] if session else None
+
+        conn.execute(
+            'INSERT INTO attendance_logs (session_id, student_id, professor_id, status, proof_path) VALUES (?, ?, ?, ?, ?)',
+            (session_id, student_id, prof_id, status, proof_path)
+        )
+        conn.commit()
+        print(f"✅ Logged Student ID {student_id} for Prof {prof_id} (Proof: {proof_path})")
         return True
     except sqlite3.IntegrityError:
         return False  # Already logged
+    finally:
+        conn.close()
+
+def manual_update_status(session_id, student_name, status):
+    """
+    Manually overrides the student status.
+    Sets is_manual = 1.
+    """
+    conn = get_db_connection()
+    try:
+        # 1. Resolve Student ID
+        stu = conn.execute("SELECT id FROM students WHERE name = ?", (student_name,)).fetchone()
+        if not stu: return False
+        
+        student_id = stu['id']
+        
+        # 2. Get Professor ID from Session
+        session = conn.execute('SELECT professor_id FROM sessions WHERE id = ?', (session_id,)).fetchone()
+        prof_id = session['professor_id'] if session else None
+
+        # 3. Upsert (Insert or Update)
+        # Check if log exists
+        exists = conn.execute(
+            "SELECT 1 FROM attendance_logs WHERE session_id = ? AND student_id = ?",
+            (session_id, student_id)
+        ).fetchone()
+        
+        if exists:
+            conn.execute(
+                "UPDATE attendance_logs SET status = ?, is_manual = 1, professor_id = ? WHERE session_id = ? AND student_id = ?",
+                (status, prof_id, session_id, student_id)
+            )
+        else:
+             conn.execute(
+                "INSERT INTO attendance_logs (session_id, student_id, professor_id, status, is_manual) VALUES (?, ?, ?, ?, 1)",
+                (session_id, student_id, prof_id, status)
+            )
+            
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Manual Update Error: {e}")
+        return False
     finally:
         conn.close()
 
@@ -338,13 +446,16 @@ def get_logs_by_session(session_id):
 
 # --- REPORTING FUNCTIONS ---
 
-def get_full_semester_data():
+def get_full_semester_data(professor_id=None, subject_id=None):
     """
     Fetches every single log for the whole semester.
     Used to generate the Master Excel Sheet.
+    Includes filtering by Professor and Subject for isolation.
     """
     conn = get_db_connection()
-    query = '''
+    
+    # Base Query
+    query = """
         SELECT 
             s.student_code,
             s.name, 
@@ -358,23 +469,82 @@ def get_full_semester_data():
         FROM students s
         JOIN attendance_logs l ON s.id = l.student_id
         JOIN sessions ses ON l.session_id = ses.id
-        ORDER BY ses.date ASC, ses.start_time ASC, s.student_code ASC
-    '''
-    rows = conn.execute(query).fetchall()
+        WHERE 1=1
+    """
+    params = []
+    
+    # Filters
+    if professor_id:
+        query += " AND ses.professor_id = ?"
+        params.append(professor_id)
+        
+    if subject_id:
+        query += " AND ses.subject_id = ?"
+        params.append(subject_id)
+        
+    query += " ORDER BY ses.date ASC, ses.start_time ASC, s.student_code ASC"
+    
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-def get_all_students():
-    """Need this to know who was ABSENT (didn't show up in logs)"""
+def get_all_students(professor_id=None, subject_id=None):
+    """
+    Need this to know who was ABSENT (didn't show up in logs).
+    If professor_id/subject_id provided, only gets enrolled students.
+    """
     conn = get_db_connection()
-    rows = conn.execute('SELECT student_code, name FROM students').fetchall()
+    
+    if subject_id:
+        # Strict Subject Enrollment
+        query = """
+            SELECT s.student_code, s.name 
+            FROM students s
+            JOIN enrollments e ON s.id = e.student_id
+            WHERE e.subject_id = ?
+        """
+        params = [subject_id]
+        
+    elif professor_id:
+        # All students enrolled in ANY subject of this Professor
+        query = """
+            SELECT DISTINCT s.student_code, s.name 
+            FROM students s
+            JOIN enrollments e ON s.id = e.student_id
+            JOIN subjects sub ON e.subject_id = sub.id
+            WHERE sub.professor_id = ?
+        """
+        params = [professor_id]
+    else:
+        # Dangerous Global Fallback (Should be avoided in API)
+        query = 'SELECT student_code, name FROM students'
+        params = []
+        
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-def get_all_sessions():
-    """Need this to create the columns in Excel"""
+def get_all_sessions(professor_id=None, subject_id=None):
+    """
+    Need this to create the columns in Excel.
+    Filters to return only relevant sessions.
+    """
     conn = get_db_connection()
-    rows = conn.execute('SELECT topic, date, start_time FROM sessions ORDER BY date ASC, start_time ASC').fetchall()
+    
+    query = "SELECT topic, date, start_time FROM sessions WHERE 1=1"
+    params = []
+    
+    if professor_id:
+        query += " AND professor_id = ?"
+        params.append(professor_id)
+        
+    if subject_id:
+        query += " AND subject_id = ?"
+        params.append(subject_id)
+        
+    query += " ORDER BY date ASC, start_time ASC"
+    
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
@@ -400,6 +570,7 @@ def get_live_monitor_data(session_id):
             s.name,
             s.image_path,
             l.check_in_time,
+            l.proof_path,
             CASE 
                 WHEN l.status IS NOT NULL THEN l.status
                 ELSE 'ABSENT' 

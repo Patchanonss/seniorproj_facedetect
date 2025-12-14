@@ -290,6 +290,17 @@ class FaceDatabase:
                     print(f"⚠️ Error processing {name}: {e}")
 
             if embedding is not None:
+                # --- SYNC ENROLLMENT (Fix for Manual Moves) ---
+                if class_id_or_code and str(class_id_or_code).isdigit():
+                     try:
+                         # 1. Ensure Student Exists (using Name as ID)
+                         db.add_student(name, name, img_path)
+                         # 2. Enroll
+                         db.enroll_student(name, subject_id=int(class_id_or_code))
+                     except Exception as e:
+                         pass
+                # ---------------------------------------------
+
                 new_embeddings.append(embedding)
                 new_names.append(name)
         
@@ -571,6 +582,7 @@ class AICameraSystem:
         
         # LAZY START STATE
         self.threads_started = False
+        self.last_accessed = time.time()  # Track activity for Auto-Stop
 
     def load_class(self, class_id):
         self.active_class_id = class_id
@@ -618,10 +630,12 @@ class AICameraSystem:
             self.reader.stop()
 
     def get_latest_frame(self):
+        self.last_accessed = time.time()  # Keep Alive
         with self.frame_lock:
             return self.current_jpeg
 
     def get_clean_frame(self):
+        self.last_accessed = time.time()  # Keep Alive
         with self.frame_lock:
             return self.current_clean_jpeg
             
@@ -630,8 +644,12 @@ class AICameraSystem:
         while self.running:
             try:
                 try:
-                    track_id, face_crop = self.recognition_queue.get(timeout=1)
+                    # UPDATED: Unpack 4 items
+                    track_id, face_crop, proof_frame, bbox = self.recognition_queue.get(timeout=1)
                 except queue.Empty:
+                    continue
+                except ValueError:
+                    # Handle legacy queue items if any (graceful fallback)
                     continue
 
                 target_embedding = self.analyzer.get_embedding(face_crop)
@@ -650,16 +668,47 @@ class AICameraSystem:
                         self.known_faces[track_id] = {'name': name, 'score': score_str, 'last_seen': time.time()}
 
                 if self.active_session_id and name != "Unknown":
-                    student = db.get_student_by_name(name)
+                    # Fix: Use session-aware lookup to handle duplicate names across classes
+                    student = db.get_student_for_session(name, self.active_session_id)
                     if student:
                         # ENROLLMENT CHECK
                         if not db.check_enrollment(student['id'], self.active_session_id):
-                             # Optional: Print only once per X seconds to avoid spam? 
-                             # For now, just print. The worker loop isn't too fast per face.
                              print(f"⚠️ Student {name} recognized but NOT enrolled. Ignoring.")
                         else:
                             with self.db_lock:
-                                db.log_attendance(self.active_session_id, student['id'])
+                                # SAVE EVIDENCE
+                                proof_rel_path = None
+                                try:
+                                    # 1. Draw Box on Proof Frame
+                                    if proof_frame is not None and bbox:
+                                        bx1, by1, bx2, by2 = bbox
+                                        # Draw Green Box
+                                        cv2.rectangle(proof_frame, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                                        # Draw Name Label
+                                        cv2.putText(proof_frame, f"{name} {score_str}", (bx1, by1 - 10), 
+                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                        
+                                        # 2. Prepare Directory: proofs/{session_id}
+                                        proof_dir = os.path.join("proofs", str(self.active_session_id))
+                                        if not os.path.exists(proof_dir):
+                                            os.makedirs(proof_dir)
+                                            
+                                        # 3. Save File: {student_id}_{timestamp}.jpg (Timestamp ensures uniqueness for raw log)
+                                        timestamp = int(time.time()*1000) # Milliseconds for safety
+                                        filename = f"{student['id']}_{timestamp}.jpg"
+                                        save_path = os.path.join(proof_dir, filename)
+                                        
+                                        cv2.imwrite(save_path, proof_frame)
+                                        proof_rel_path = f"/proofs/{self.active_session_id}/{filename}"
+                                        
+                                except Exception as e:
+                                    print(f"⚠️ Failed to save proof for {name}: {e}")
+
+                                # 1. ALWAYS LOG RAW DATA (User Requirement)
+                                db.log_raw_face(self.active_session_id, student['id'], 0.0, proof_rel_path)
+
+                                # 2. LOG OFFICIAL ATTENDANCE (Once per session)
+                                db.log_attendance(self.active_session_id, student['id'], "PRESENT", proof_rel_path)
 
                 if track_id in self.processing_ids:
                     self.processing_ids.remove(track_id)
@@ -747,7 +796,7 @@ class AICameraSystem:
                                 w = x2 - x1
                                 h = y2 - y1
                                 
-                                # 1. Aspect Ratio Filter
+                                # 1. Aspect Ratio Filterik
                                 if w > 0 and (h / w) > 3.5:
                                     continue
                                     
@@ -790,7 +839,9 @@ class AICameraSystem:
                                             face_crop = frame[cy1:cy2, cx1:cx2].copy()
                                             self.processing_ids.add(track_id)
                                             try:
-                                                self.recognition_queue.put_nowait((track_id, face_crop))
+                                                # Pass Frame + Box for Evidence
+                                                # (track_id, crop, full_frame, (x1,y1,x2,y2))
+                                                self.recognition_queue.put_nowait((track_id, face_crop, frame.copy(), (x1,y1,x2,y2)))
                                             except queue.Full:
                                                 pass
                     
@@ -828,6 +879,12 @@ class AICameraSystem:
         frame_count = 0
 
         while self.running:
+            # AUTO-STOP CHECK
+            if time.time() - self.last_accessed > 5.0:
+                 print("💤 Camera Idle (5s Timeout). Auto-stopping...")
+                 self.stop_loop()
+                 self.threads_started = False
+                 break
             loop_start = time.time()
             try:
                 ret, frame = self.reader.read()

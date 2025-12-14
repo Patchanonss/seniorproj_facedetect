@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Response, BackgroundTasks
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -45,6 +46,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Use absolute path for safety
+ABS_PATH = os.path.dirname(os.path.abspath(__file__))
+PROOFS_DIR = os.path.join(ABS_PATH, "proofs")
+if not os.path.exists(PROOFS_DIR):
+    os.makedirs(PROOFS_DIR)
+
+app.mount("/proofs", StaticFiles(directory=PROOFS_DIR), name="proofs")
 
 
 # --- DATA MODELS ---
@@ -176,18 +185,32 @@ def get_monitor_data(session_id: int):
 # 2. CONTROL THE CLASS
 @app.post("/start_class")
 def start_class(session: ClassSession, current_user: dict = auth.Depends(auth.get_current_user)):
+    print(f"🚀 Starting Class: {session.topic} (Code: {session.subject_code})")
+    
+    # 1. Create Session in DB (Linked to Professor)
+    session_id = db.create_session(
+        topic=session.topic, 
+        subject_code=session.subject_code,
+        professor_id=current_user['id'], # LINK TO PROFESSOR
+        room=session.room
+    )
+    
+    # 2. Add Room Info to Session Object (Optional, for memory)
+    # This part of the instruction was a comment, so the existing logic for subject_id and ai_system.load_class is retained.
+    
     # 1. Determine Subject ID (Create if needed)
     subject_id = None
     if session.subject_code:
         subject_id = db.create_subject(session.subject_code, session.subject_code) # Lazy create name=code
         
     # 2. Create Session linked to Professor
-    session_id = db.create_session(
-        topic=session.topic, 
-        subject_code=session.subject_code, 
-        professor_id=current_user['id'], 
-        room=session.room
-    )
+    # This was the original call, now it's effectively the first step with the new comment.
+    # session_id = db.create_session(
+    #     topic=session.topic, 
+    #     subject_code=session.subject_code, 
+    #     professor_id=current_user['id'], 
+    #     room=session.room
+    # )
     
     # 3. Load AI Class
     if subject_id:
@@ -226,12 +249,16 @@ def get_registration_status():
 @app.get("/subjects")
 def get_subjects(current_user: dict = auth.Depends(auth.get_current_user)):
     conn = db.get_db_connection()
-    # TODO: Filter by professor_id once DB schema fully mandates ownership
-    # For now, list all or just owned? Let's try listing all for MVP simplicity
-    # but ideally: WHERE professor_id = ?
-    # Currently DB.create_subject doesn't take professor_id yet? Let's check DB schema.
-    # Schema HAS professor_id.
-    rows = conn.execute('SELECT * FROM subjects').fetchall()
+    # Filter by the logged-in professor's ID
+    # Also join with enrollments to get student count
+    query = '''
+        SELECT s.*, COUNT(e.student_id) as student_count
+        FROM subjects s
+        LEFT JOIN enrollments e ON s.id = e.subject_id
+        WHERE s.professor_id = ?
+        GROUP BY s.id
+    '''
+    rows = conn.execute(query, (current_user['id'],)).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
@@ -296,19 +323,70 @@ def manual_attendance(update: ManualUpdate):
         raise HTTPException(status_code=404, detail="Student not found.")
 
     return {"message": f"Updated {update.student_name} to {update.status}"}
+
+class StudentCheckIn(BaseModel):
+    student_code: str
+
+@app.post("/attendance/student_self_checkin")
+def student_self_checkin(payload: StudentCheckIn):
+    """
+    Allows a student to manually check in using their Student ID (Code).
+    Only works if a class session is active.
+    """
+    if ai_system.active_session_id is None:
+        raise HTTPException(status_code=400, detail="No active class session.")
+        
+    conn = db.get_db_connection()
+    try:
+        # 1. Find Student
+        student = conn.execute("SELECT * FROM students WHERE student_code = ?", (payload.student_code,)).fetchone()
+        if not student:
+            raise HTTPException(status_code=404, detail="Student ID not found.")
+            
+        student_id = student['id']
+        name = student['name']
+        
+        # 2. Check Enrollment (Optional, but good practice)
+        # For now, let's assume if they exist, they can try to check in.
+        # But we should check if they are enrolled in the current session's subject.
+        session = conn.execute("SELECT subject_id FROM sessions WHERE id = ?", (ai_system.active_session_id,)).fetchone()
+        if session:
+             enrollment = conn.execute(
+                "SELECT 1 FROM enrollments WHERE student_id = ? AND subject_id = ?", 
+                (student_id, session['subject_id'])
+             ).fetchone()
+             if not enrollment:
+                 raise HTTPException(status_code=403, detail="You are not enrolled in this class.")
+
+        # 3. Log Attendance (Status = PRESENT, is_manual = 1)
+        # reusing manual_update_status logic but bypassing name lookup
+        # actually db.manual_update_status takes name. Let's just do direct DB insert or use log_attendance and set manual flag?
+        # log_attendance doesn't set manual flag.
+        # manual_update_status uses name.
+        # Let's just call manual_update_status since we have the name.
+        
+        success = db.manual_update_status(ai_system.active_session_id, name, "PRESENT")
+        
+        if success:
+             return {"message": "Checked in successfully", "student_name": name}
+        else:
+             raise HTTPException(status_code=500, detail="Failed to log attendance.")
+             
+    finally:
+        conn.close()
     
     
 # 4.5 EXPORT ENDPOINT
 # 4.5 EXPORT ENDPOINT
 @app.get("/export/attendance")
-def export_attendance():
+def export_attendance(subject_id: int = None, professor_id: int = None):
     import pandas as pd
     from io import BytesIO
     
-    # 1. Fetch ALL Data needed for the matrix
-    logs = db.get_full_semester_data()
-    all_students = db.get_all_students()
-    all_sessions = db.get_all_sessions()
+    # 1. Fetch ALL Data needed for the matrix (Explicit ID Filter)
+    logs = db.get_full_semester_data(professor_id=professor_id, subject_id=subject_id)
+    all_students = db.get_all_students(professor_id=professor_id, subject_id=subject_id)
+    all_sessions = db.get_all_sessions(professor_id=professor_id, subject_id=subject_id)
     
     # 2. Prepare Lists for Keys
     # Students
@@ -329,8 +407,8 @@ def export_attendance():
 
     # 3. Create Base DataFrame from Logs
     if not logs:
-        # If no logs, create an empty frame with all students and sessions labeled ABSENT
-        # This is a bit complex, simpler to just make a DataFrame with NaN and fill
+        # If no logs, likely no data OR empty class.
+        # We still want the matrix if students exist.
         df = pd.DataFrame(columns=['student_code', 'name', 'session_label', 'status'])
     else:
         df = pd.DataFrame(logs)
@@ -349,10 +427,11 @@ def export_attendance():
         )
     else:
         pivot_df = pd.DataFrame()
+        # Create empty structure if we have specific lists
+        if not student_df.empty:
+            pivot_df = pd.DataFrame(index=pd.MultiIndex.from_frame(student_df[['student_code', 'name']]))
 
-    # 5. Enforce Structure (The "Right Join" logic)
-    # Reindex Index (Rows) -> All Students
-    # Create MultiIndex for students
+    # 5. Reindex to Ensure ALL Students are visible (Even if absent)
     if not student_df.empty:
         student_index = pd.MultiIndex.from_frame(student_df[['student_code', 'name']])
         pivot_df = pivot_df.reindex(index=student_index)
@@ -369,9 +448,12 @@ def export_attendance():
     pivot_df.to_csv(stream)
     
     response = Response(content=stream.getvalue(), media_type="text/csv")
-    response.headers["Content-Disposition"] = "attachment; filename=attendance_report.csv"
+    filename = f"attendance_report_{subject_id}.csv" if subject_id else "attendance_report_all.csv"
+    response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     
     return response
+
+
 
 
 # 5. REGISTRATION ENDPOINT (UPDATED FOR PYTORCH)
