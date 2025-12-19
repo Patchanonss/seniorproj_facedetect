@@ -46,11 +46,36 @@ class FaceAnalyzer:
         # 2. VALIDATOR: For quality checks & reloading (Separate instance to avoid locking)
         self.validator = YOLO(self.MODEL_PATH, task='pose') if os.path.exists(self.MODEL_PATH) else YOLO('yolov8n.pt')
 
-    def get_embedding(self, face_img):
+    def get_embedding(self, face_img, keypoints=None):
         """
-        Adds black bars to make it square, then embeds.
+        Aligns face (if keypoints provided), adds black bars, then embeds.
         """
         try:
+            # --- GEOMETRIC ALIGNMENT (NEW) ---
+            if keypoints is not None:
+                # Expecting keypoints in original image coordinates corresponding to face_img
+                # Keypoints: 0: Left Eye, 1: Right Eye, 2: Nose, 3: Left Mouth, 4: Right Mouth
+                if len(keypoints) >= 2:
+                    left_eye = keypoints[0]
+                    right_eye = keypoints[1]
+                    
+                    # Calculate Angle
+                    dy = right_eye[1] - left_eye[1]
+                    dx = right_eye[0] - left_eye[0]
+                    angle = np.degrees(np.arctan2(dy, dx))
+                    
+                    # Rotate Image
+                    # Get center of face
+                    h, w = face_img.shape[:2]
+                    center = (w // 2, h // 2)
+                    
+                    # Compute Rotation Matrix
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    
+                    # Perform Rotation
+                    face_img = cv2.warpAffine(face_img, M, (w, h), flags=cv2.INTER_CUBIC)
+            # -----------------------------------
+
             h, w = face_img.shape[:2]
 
             # --- SQUARE CROP LOGIC ---
@@ -69,11 +94,15 @@ class FaceAnalyzer:
             # -----------------------------------
 
             face_img = cv2.resize(face_img, (160, 160))
-            face_img = np.float32(face_img) / 255.0
+            # FIXED NORMALIZATION: FaceNet (vggface2) expects [-1, 1] approx, or whitening.
+            # (x - 127.5) / 128.0 is the standard fixed normalization for FaceNet.
+            face_img = (np.float32(face_img) - 127.5) / 128.0
             face_tensor = torch.from_numpy(face_img).permute(2, 0, 1).unsqueeze(0).to(self.device)
 
             with torch.no_grad():
                 embedding = self.recognizer(face_tensor)
+                # L2 NORMALIZE (CRITICAL for Euclidean Distance)
+                embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
 
             return embedding[0]
         except Exception:
@@ -161,7 +190,7 @@ class FaceAnalyzer:
 # Handles loading gallery, caching, and matching
 # ==========================================
 class FaceDatabase:
-    def __init__(self, db_path="gallery", confidence_threshold=0.81, device=None):
+    def __init__(self, db_path="gallery", confidence_threshold=0.55, device=None):
         self.DB_PATH = db_path
         self.CONFIDENCE_THRESHOLD = confidence_threshold
         self.device = device or torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -262,12 +291,14 @@ class FaceDatabase:
                     if results and results[0].boxes:
                         largest_area = 0
                         best_box = None
-                        for box in results[0].boxes:
+                        best_idx = -1
+                        for i, box in enumerate(results[0].boxes):
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             area = (x2 - x1) * (y2 - y1)
                             if area > largest_area:
                                 largest_area = area
                                 best_box = (x1, y1, x2, y2)
+                                best_idx = i # TRACK INDEX
                         
                         if best_box:
                             x1, y1, x2, y2 = best_box
@@ -277,14 +308,34 @@ class FaceDatabase:
                         face_crop = img # Fallback
 
                     face_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                    embedding = face_analyzer.get_embedding(face_crop)
+                    
+                    # ALIGNMENT: Pass Keypoints if available
+                    keypoints_for_align = None
+                    if results and results[0].keypoints is not None:
+                         # Keypoints are on the FULL image 'img'
+                         # But 'face_crop' is a slice.
+                         # FaceAnalyzer.get_embedding expects crop.
+                         # AND alignment logic expects keypoints relative to that crop.
+                         
+                         if best_box and best_idx != -1:
+                             bx1, by1, bx2, by2 = best_box
+                             # Use best_idx to get the CORRECT keypoints
+                             raw_kpts = results[0].keypoints.xy[best_idx].cpu().numpy() 
+                             
+                             # Adjust keypoints to be relative to the CROP
+                             keypoints_for_align = []
+                             for (kx, ky) in raw_kpts:
+                                 keypoints_for_align.append((kx - bx1, ky - by1))
+                                 
+                    is_aligned = "Aligned" if keypoints_for_align is not None else "Unaligned"
+                    embedding = face_analyzer.get_embedding(face_crop, keypoints=keypoints_for_align)
                     
                     if embedding is not None:
                         # Moves to CPU for storage
                         embedding = embedding.cpu()
                         # Save Granular Cache
                         torch.save(embedding, vector_path)
-                        print(f"   -> Generated & Saved {name}.pt")
+                        print(f"   -> Generated & Saved {name}.pt ({is_aligned})")
                         
                 except Exception as e:
                     print(f"⚠️ Error processing {name}: {e}")
@@ -332,6 +383,7 @@ class FaceDatabase:
             if min_dist < self.CONFIDENCE_THRESHOLD: 
                 name = self.face_db_names[best_idx]
                 score_str = f"({min_dist:.2f})"
+            print(f"🕵️ OPTIONAL LOG: Closest: {self.face_db_names[best_idx]} ({min_dist:.4f})")
         
         return name, score_str
         
@@ -644,30 +696,52 @@ class AICameraSystem:
         while self.running:
             try:
                 try:
-                    # UPDATED: Unpack 4 items
-                    track_id, face_crop, proof_frame, bbox = self.recognition_queue.get(timeout=1)
+                    # UPDATED: Unpack 5 items (Added kpts)
+                    track_id, face_crop, proof_frame, bbox, kpts_for_align = self.recognition_queue.get(timeout=1)
                 except queue.Empty:
                     continue
                 except ValueError:
                     # Handle legacy queue items if any (graceful fallback)
                     continue
 
-                target_embedding = self.analyzer.get_embedding(face_crop)
+                # FIX: Convert BGR to RGB before embedding!
+                face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                target_embedding = self.analyzer.get_embedding(face_rgb, keypoints=kpts_for_align)
+                
                 name, score_str = self.face_db.get_match(target_embedding)
 
+                # DEBUG: Check Alignment & Norm
+                is_aligned_live = "Aligned" if kpts_for_align else "Unaligned"
+                norm_val = torch.norm(target_embedding).item()
+                # if name == "Unknown":
+                # print(f"🔍 Live: {is_aligned_live} | Norm: {norm_val:.4f} | Dist: {score_str}")
+
+                # --- TEMPORAL SMOOTHING (3-Strike Rule) ---
+                consecutive_hits = 0
                 if track_id is not None:
-                    # LABEL SMOOTHING logic
-                    update = True
-                    if track_id in self.known_faces:
-                        old_data = self.known_faces[track_id]
-                        if old_data['name'] != "Unknown" and name == "Unknown":
-                            if time.time() - old_data['last_seen'] < 2.0: # Keep known name for 2s
-                                update = False
+                    old_data = self.known_faces.get(track_id, {})
+                    old_name = old_data.get('name', 'Unknown')
+                    old_count = old_data.get('consecutive_count', 0)
+                    
+                    if name != "Unknown":
+                        if name == old_name:
+                            consecutive_hits = old_count + 1
+                        else:
+                            consecutive_hits = 1 # Reset: New Name
+                    else:
+                        consecutive_hits = 0 # Data lost
+                    
+                    # Update State
+                    self.known_faces[track_id] = {
+                        'name': name, 
+                        'score': score_str, 
+                        'last_seen': time.time(),
+                        'consecutive_count': consecutive_hits
+                    }
 
-                    if update:
-                        self.known_faces[track_id] = {'name': name, 'score': score_str, 'last_seen': time.time()}
-
-                if self.active_session_id and name != "Unknown":
+                # --- ATTENDANCE LOGGING ---
+                # Only log if we have 3 consecutive hits for the SAME person
+                if self.active_session_id and name != "Unknown" and consecutive_hits >= 3:
                     # Fix: Use session-aware lookup to handle duplicate names across classes
                     student = db.get_student_for_session(name, self.active_session_id)
                     if student:
@@ -796,6 +870,10 @@ class AICameraSystem:
                                 w = x2 - x1
                                 h = y2 - y1
                                 
+                                # 0. Minimum Size Filter (NEW)
+                                if w < 80 or h < 80:
+                                    continue
+                                
                                 # 1. Aspect Ratio Filterik
                                 if w > 0 and (h / w) > 3.5:
                                     continue
@@ -827,7 +905,7 @@ class AICameraSystem:
                                     should_process = True
                                     if track_id in self.known_faces:
                                         d = self.known_faces[track_id]
-                                        if time.time() - d['last_seen'] < 1.0:
+                                        if time.time() - d['last_seen'] < 0.2:
                                             should_process = False
                                     
                                     if should_process:
@@ -839,9 +917,21 @@ class AICameraSystem:
                                             face_crop = frame[cy1:cy2, cx1:cx2].copy()
                                             self.processing_ids.add(track_id)
                                             try:
-                                                # Pass Frame + Box for Evidence
-                                                # (track_id, crop, full_frame, (x1,y1,x2,y2))
-                                                self.recognition_queue.put_nowait((track_id, face_crop, frame.copy(), (x1,y1,x2,y2)))
+                                                # PREPARE KEYPOINTS FOR ALIGNMENT
+                                                # Convert keypoints from Small Frame -> Original Frame -> Relative to Crop
+                                                kpts_relative = []
+                                                if keypoints is not None:
+                                                    raw_kpts = keypoints.xy[i].cpu().numpy()
+                                                    for (kx, ky) in raw_kpts:
+                                                        # 1. Scale to Orig
+                                                        orig_x = kx / scale
+                                                        orig_y = ky / scale
+                                                        # 2. Relative to Crop (cx1, cy1)
+                                                        kpts_relative.append((orig_x - cx1, orig_y - cy1))
+
+                                                # Pass Frame + Box + Keypoints for Evidence & Alignment
+                                                # (track_id, crop, full_frame, (x1,y1,x2,y2), keypoints)
+                                                self.recognition_queue.put_nowait((track_id, face_crop, frame.copy(), (x1,y1,x2,y2), kpts_relative))
                                             except queue.Full:
                                                 pass
                     

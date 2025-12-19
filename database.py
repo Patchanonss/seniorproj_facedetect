@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 import os
+import uuid
 
 DB_NAME = "attendance.db"
 
@@ -34,6 +35,7 @@ def init_db(gallery_path="gallery"):
         student_code TEXT UNIQUE NOT NULL,
         name TEXT NOT NULL,
         image_path TEXT,
+        uuid TEXT UNIQUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
@@ -45,6 +47,7 @@ def init_db(gallery_path="gallery"):
         code TEXT UNIQUE NOT NULL,
         name TEXT NOT NULL,
         professor_id INTEGER,
+        uuid TEXT UNIQUE,
         FOREIGN KEY (professor_id) REFERENCES professors (id)
     )
     ''')
@@ -61,6 +64,7 @@ def init_db(gallery_path="gallery"):
         start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         end_time TIMESTAMP,
         is_active BOOLEAN DEFAULT 1,
+        uuid TEXT UNIQUE,
         FOREIGN KEY (subject_id) REFERENCES subjects (id),
         FOREIGN KEY (professor_id) REFERENCES professors (id)
     )
@@ -208,6 +212,12 @@ def get_student_by_name(name):
     conn.close()
     return student
 
+def get_student_by_uuid(uuid_str):
+    conn = get_db_connection()
+    stu = conn.execute('SELECT * FROM students WHERE uuid = ?', (uuid_str,)).fetchone()
+    conn.close()
+    return stu
+
 def get_student_for_session(name, session_id):
     """
     Finds a student by name who is enrolled in the CURRENT session's subject.
@@ -255,6 +265,12 @@ def create_subject(code, name, professor_id=None):
         return row['id']
     finally:
         conn.close()
+
+def get_subject_by_uuid(uuid_str):
+    conn = get_db_connection()
+    sub = conn.execute('SELECT * FROM subjects WHERE uuid = ?', (uuid_str,)).fetchone()
+    conn.close()
+    return sub
 
 def enroll_student(student_code, subject_code=None, subject_id=None):
     conn = get_db_connection()
@@ -308,26 +324,59 @@ def check_enrollment(student_id, session_id):
 def create_session(topic=None, subject_code=None, professor_id=None, room=None):
     conn = get_db_connection()
     now = datetime.datetime.now()
-    
+    today_date = now.strftime('%Y-%m-%d')
+    start_time = now.strftime('%H:%M:%S')
+
     subject_id = None
     if subject_code:
-        # Auto-create subject if passing a code directly (Soft Launch)
-        # TODO: Assign professor_id to subject too if new?
-        subject_id = create_subject(subject_code, subject_code) 
-        # Update subject owner if not set? Skip for now.
+        # Auto-create subject if passing a code directly (Check if exists first)
+        sid = create_subject(subject_code, subject_code) 
+        subject_id = sid
 
     if not topic:
-        topic = f"Class - {now.strftime('%Y-%m-%d')}"
+        topic = f"Class - {today_date}"
+
+    # --- RESUME LOGIC (User Req: Same Name + Same Class = Same Session) ---
+    # Check if a session exists with SAME Subject AND Topic (Ignoring Date)
+    if subject_id:
+        existing = conn.execute(
+            'SELECT id, uuid, date FROM sessions WHERE subject_id = ? AND topic = ? AND professor_id = ? ORDER BY id DESC LIMIT 1',
+            (subject_id, topic, professor_id)
+        ).fetchone()
+        
+        if existing:
+            # Found one! Resuming it.
+            sess_id = existing['id']
+            sess_uuid = existing['uuid']
+            print(f"🔄 Resuming Existing Session ID {sess_id} from {existing['date']}")
+            
+            # Reactivate just in case
+            conn.execute('UPDATE sessions SET is_active = 1 WHERE id = ?', (sess_id,))
+            conn.commit()
+            conn.close()
+            return sess_id, sess_uuid
+    # ---------------------------------------------------------------------
 
     cursor = conn.cursor()
+    # Create New
+    session_uuid = str(uuid.uuid4())
+    cursor = conn.cursor()
     cursor.execute(
-        'INSERT INTO sessions (subject_id, professor_id, topic, room, date, start_time, is_active) VALUES (?, ?, ?, ?, ?, ?, 1)',
-        (subject_id, professor_id, topic, room, now.strftime('%Y-%m-%d'), now.strftime('%H:%M:%S'))
+        'INSERT INTO sessions (uuid, subject_id, professor_id, topic, room, date, start_time, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
+        (session_uuid, subject_id, professor_id, topic, room, today_date, start_time)
     )
     session_id = cursor.lastrowid
+    
     conn.commit()
     conn.close()
-    return session_id
+    return session_id, session_uuid
+
+
+def get_session_by_uuid(uuid_str):
+    conn = get_db_connection()
+    sess = conn.execute('SELECT * FROM sessions WHERE uuid = ?', (uuid_str,)).fetchone()
+    conn.close()
+    return sess
 
 
 def get_active_session():
@@ -337,6 +386,18 @@ def get_active_session():
     ).fetchone()
     conn.close()
     return session
+
+def get_recent_sessions_for_subject(subject_id):
+    """
+    Returns active or recent sessions for the popup.
+    """
+    conn = get_db_connection()
+    rows = conn.execute(
+        'SELECT * FROM sessions WHERE subject_id = ? ORDER BY id DESC LIMIT 5',
+        (subject_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def close_session(session_id):
@@ -434,7 +495,7 @@ def manual_update_status(session_id, student_name, status):
 def get_logs_by_session(session_id):
     conn = get_db_connection()
     query = '''
-        SELECT s.name, s.student_code, l.check_in_time, l.status 
+        SELECT s.name, s.student_code, s.image_path, l.check_in_time, l.status 
         FROM attendance_logs l
         JOIN students s ON l.student_id = s.id
         WHERE l.session_id = ?
@@ -524,6 +585,128 @@ def get_all_students(professor_id=None, subject_id=None):
     conn.close()
     return [dict(row) for row in rows]
 
+# --- ADVANCED EXPORT LOGIC ---
+
+def get_filter_options():
+    """
+    Returns unique lists of all filterable entities.
+    Used to populate the MultiSelect dropdowns on the frontend.
+    """
+    conn = get_db_connection()
+    options = {
+        "subjects": [dict(r) for r in conn.execute("SELECT id, code, name FROM subjects ORDER BY code").fetchall()],
+        "professors": [dict(r) for r in conn.execute("SELECT id, full_name as name FROM professors ORDER BY full_name").fetchall()],
+        "rooms": [r['room'] for r in conn.execute("SELECT DISTINCT room FROM sessions WHERE room IS NOT NULL ORDER BY room").fetchall()],
+        "sessions": [dict(r) for r in conn.execute("SELECT id, topic, date, subject_id FROM sessions ORDER BY date DESC").fetchall()],
+        "students": [dict(r) for r in conn.execute("""
+            SELECT s.id, s.student_code, s.name, GROUP_CONCAT(e.subject_id) as subject_ids
+            FROM students s
+            LEFT JOIN enrollments e ON s.id = e.student_id
+            GROUP BY s.id
+            ORDER BY s.student_code
+        """).fetchall()]
+    }
+    conn.close()
+    return options
+
+def get_advanced_export_data(filters):
+    """
+    Dynamic SQL Builder for 'Human Logic' Tag Filtering.
+    filters = {
+        'subject_ids': [1, 2],    # OR match
+        'room_names': ['507'],    # OR match
+        'start_date': 'YYYY-MM-DD',
+        'end_date': 'YYYY-MM-DD',
+        ...
+    }
+    AND applies ACROSS categories.
+    """
+    conn = get_db_connection()
+    
+    # Base Query: Get ALL Logs + Session Info + Student Info
+    query = """
+        SELECT 
+            l.id as log_id,
+            l.status,
+            l.check_in_time,
+            s.student_code,
+            s.name as student_name,
+            ses.topic as session_topic,
+            ses.date as session_date,
+            ses.room,
+            sub.code as subject_code,
+            sub.name as subject_name,
+            p.full_name as professor_name
+        FROM attendance_logs l
+        JOIN sessions ses ON l.session_id = ses.id
+        JOIN students s ON l.student_id = s.id
+        LEFT JOIN subjects sub ON ses.subject_id = sub.id
+        LEFT JOIN professors p ON ses.professor_id = p.id
+        WHERE 1=1
+    """
+    params = []
+    
+    # --- DYNAMIC FILTERS ---
+    
+    # 1. Date Range (Inclusive)
+    if filters.get('start_date'):
+        query += " AND ses.date >= ?"
+        params.append(filters['start_date'])
+        
+    if filters.get('end_date'):
+        query += " AND ses.date <= ?"
+        params.append(filters['end_date'])
+        
+    # 2. Subjects (OR List)
+    if filters.get('subject_ids'):
+        ids = filters['subject_ids']
+        if ids:
+            placeholders = ','.join('?' * len(ids))
+            query += f" AND ses.subject_id IN ({placeholders})"
+            params.extend(ids)
+            
+    # 3. Rooms (OR List)
+    if filters.get('rooms'):
+        rooms = filters['rooms']
+        if rooms:
+            placeholders = ','.join('?' * len(rooms))
+            query += f" AND ses.room IN ({placeholders})"
+            params.extend(rooms)
+
+    # 4. Professors (OR List)
+    if filters.get('professor_ids'):
+        pids = filters['professor_ids']
+        if pids:
+            placeholders = ','.join('?' * len(pids))
+            query += f" AND ses.professor_id IN ({placeholders})"
+            params.extend(pids)
+
+    # 5. Specific Sessions (OR List)
+    if filters.get('session_ids'):
+        sids = filters['session_ids']
+        if sids:
+            placeholders = ','.join('?' * len(sids))
+            query += f" AND ses.id IN ({placeholders})"
+            params.extend(sids)
+
+    # 6. Specific Students (OR List)
+    if filters.get('student_ids'):
+        st_ids = filters['student_ids']
+        if st_ids:
+            placeholders = ','.join('?' * len(st_ids))
+            query += f" AND l.student_id IN ({placeholders})"
+            params.extend(st_ids)
+
+    query += " ORDER BY ses.date ASC, ses.start_time ASC, s.student_code ASC"
+    
+    # Execute
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    
+    # Return List of Dicts (Raw Data)
+    # The 'Class View' pivot logic will be handled by the API/Pandas to keep SQL simple.
+    return [dict(row) for row in rows]
+
 def get_all_sessions(professor_id=None, subject_id=None):
     """
     Need this to create the columns in Excel.
@@ -571,6 +754,7 @@ def get_live_monitor_data(session_id):
             s.image_path,
             l.check_in_time,
             l.proof_path,
+            (SELECT COUNT(*) FROM raw_face_logs r WHERE r.session_id = ? AND r.student_id = s.id) as detection_count,
             CASE 
                 WHEN l.status IS NOT NULL THEN l.status
                 ELSE 'ABSENT' 
@@ -582,7 +766,7 @@ def get_live_monitor_data(session_id):
         ORDER BY s.student_code ASC
     '''
     
-    rows = conn.execute(query, (session_id, subject_id)).fetchall()
+    rows = conn.execute(query, (session_id, session_id, subject_id)).fetchall()
     conn.close()
     
     students = [dict(row) for row in rows]
@@ -591,6 +775,17 @@ def get_live_monitor_data(session_id):
         "session_info": dict(sess),
         "students": students
     }
+
+def get_session_details(session_id):
+    conn = get_db_connection()
+    row = conn.execute('''
+        SELECT s.id, s.topic, s.room, s.date, sub.name as subject_name, sub.code as subject_code, s.uuid as session_uuid
+        FROM sessions s
+        JOIN subjects sub ON s.subject_id = sub.id
+        WHERE s.id = ?
+    ''', (session_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 # Init on load
 init_db()

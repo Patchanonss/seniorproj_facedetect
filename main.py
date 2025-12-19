@@ -9,6 +9,8 @@ import numpy as np
 import os
 import time
 import io
+import pandas as pd
+from typing import List, Optional
 
 # --- CUSTOM MODULES ---
 # import core_AI
@@ -55,6 +57,11 @@ if not os.path.exists(PROOFS_DIR):
 
 app.mount("/proofs", StaticFiles(directory=PROOFS_DIR), name="proofs")
 
+GALLERY_DIR = os.path.join(ABS_PATH, "gallery")
+if not os.path.exists(GALLERY_DIR):
+    os.makedirs(GALLERY_DIR)
+app.mount("/gallery", StaticFiles(directory=GALLERY_DIR), name="gallery")
+
 
 # --- DATA MODELS ---
 class ClassSession(BaseModel):
@@ -99,7 +106,7 @@ def read_root():
 
 # --- AUTH ROUTES ---
 @app.post("/auth/register")
-def register(user: UserRegister):
+def register(user: UserRegister, current_user: dict = auth.Depends(auth.get_current_user)):
     hashed_pw = auth.get_password_hash(user.password)
     success = db.create_professor(user.username, hashed_pw, user.full_name)
     if not success:
@@ -114,11 +121,6 @@ def login(user: UserLogin):
     
     access_token = auth.create_access_token(data={"sub": prof['username']})
     return {"access_token": access_token, "token_type": "bearer", "user": {"id": prof['id'], "name": prof['full_name']}}
-
-@app.get("/auth/me")
-def read_users_me(current_user: dict = auth.Depends(auth.get_current_user)):
-    return {"username": current_user['username'], "full_name": current_user['full_name'], "id": current_user['id']}
-
 
 # 1. THE VIDEO STREAM
 def generate_frames(clean=False):
@@ -172,60 +174,76 @@ def capture_frame_endpoint():
     return Response(content=b"", media_type="image/jpeg")
 
 @app.get("/session/monitor")
-def get_monitor_data(session_id: int):
+def get_monitor_data(session_id: int, current_user: dict = auth.Depends(auth.get_current_user)):
     # This endpoint is PUBLIC (or maybe protected by token, but kept simple for now)
     # Allows separate browser to view status.
     data = db.get_live_monitor_data(session_id)
-    if not data:
-        raise HTTPException(status_code=404, detail="Session not found")
     return data
 
 
-# 2. CONTROL THE CLASS
+@app.get("/api/session/{uuid_str}/monitor")
+def get_monitor_data_uuid(uuid_str: str):
+    """
+    Public/Secure endpoint for Student View (Projector mode)
+    """
+    sess = db.get_session_by_uuid(uuid_str)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    data = db.get_live_monitor_data(sess['id'])
+    return data
+
+@app.get("/api/session/{uuid_str}/logs")
+def get_session_logs_uuid(uuid_str: str):
+    """
+    Public/Secure endpoint for Sidebar Persistence
+    """
+    sess = db.get_session_by_uuid(uuid_str)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    logs = db.get_logs_by_session(sess['id'])
+    return logs
+
+@app.get("/api/sessions/recent")
+def get_recent_sessions(subject_id: int):
+    """
+    Returns list of recent sessions for the popup
+    """
+    return db.get_recent_sessions_for_subject(subject_id)
+
 # 2. CONTROL THE CLASS
 @app.post("/start_class")
 def start_class(session: ClassSession, current_user: dict = auth.Depends(auth.get_current_user)):
     print(f"🚀 Starting Class: {session.topic} (Code: {session.subject_code})")
     
     # 1. Create Session in DB (Linked to Professor)
-    session_id = db.create_session(
+    # create_session now returns (id, uuid)
+    session_id, session_uuid = db.create_session(
         topic=session.topic, 
         subject_code=session.subject_code,
         professor_id=current_user['id'], # LINK TO PROFESSOR
         room=session.room
     )
+
+    sess_data = db.get_active_session() 
     
-    # 2. Add Room Info to Session Object (Optional, for memory)
-    # This part of the instruction was a comment, so the existing logic for subject_id and ai_system.load_class is retained.
-    
-    # 1. Determine Subject ID (Create if needed)
-    subject_id = None
     if session.subject_code:
-        subject_id = db.create_subject(session.subject_code, session.subject_code) # Lazy create name=code
-        
-    # 2. Create Session linked to Professor
-    # This was the original call, now it's effectively the first step with the new comment.
-    # session_id = db.create_session(
-    #     topic=session.topic, 
-    #     subject_code=session.subject_code, 
-    #     professor_id=current_user['id'], 
-    #     room=session.room
-    # )
-    
-    # 3. Load AI Class
-    if subject_id:
-        print(f"🔄 Switching AI to Class ID: {subject_id}")
-        ai_system.load_class(subject_id)
+        conn = db.get_db_connection()
+        s_row = conn.execute("SELECT id FROM subjects WHERE code = ?", (session.subject_code,)).fetchone()
+        conn.close()
+        if s_row:
+             ai_system.load_class(s_row['id'])
     else:
         print("⚠️ Starting Legacy/Open Session (No Class Isolation)")
         ai_system.load_class("legacy")
 
     ai_system.active_session_id = session_id
-    return {"message": "Class started", "session_id": session_id}
+    return {"message": "Class started", "session_id": session_id, "session_uuid": session_uuid}
 
 
 @app.post("/end_class")
-def end_class():
+def end_class(current_user: dict = auth.Depends(auth.get_current_user)):
     current_session = ai_system.active_session_id
     if current_session:
         db.close_session(current_session)
@@ -233,7 +251,7 @@ def end_class():
     return {"message": "Class ended"}
     
 @app.post("/session/toggle_registration")
-def toggle_registration(enable: bool):
+def toggle_registration(enable: bool, current_user: dict = auth.Depends(auth.get_current_user)):
     ai_system.allow_registration = enable
     status = "Enabled" if enable else "Disabled"
     print(f"🔓 Registration {status}")
@@ -284,7 +302,7 @@ def create_subject_endpoint(payload: SubjectPayload, current_user: dict = auth.D
     return {"message": "Subject created"}
 
 @app.post("/enroll")
-def enroll_student(payload: EnrollmentPayload):
+def enroll_student(payload: EnrollmentPayload, current_user: dict = auth.Depends(auth.get_current_user)):
     success, msg = db.enroll_student(payload.student_code, payload.subject_code)
     if not success:
         raise HTTPException(status_code=400, detail=msg)
@@ -293,23 +311,28 @@ def enroll_student(payload: EnrollmentPayload):
 
 # 3. DATA FOR DASHBOARD
 @app.get("/attendance/live")
-def get_live_attendance():
+def get_live_attendance(current_user: dict = auth.Depends(auth.get_current_user)):
     """Fetches real-time logs for the Dashboard table"""
     if ai_system.active_session_id is None:
         return {"status": "inactive", "logs": []}
 
     logs = db.get_logs_by_session(ai_system.active_session_id)
+    details = db.get_session_details(ai_system.active_session_id)
 
     return {
         "status": "active",
         "session_id": ai_system.active_session_id,
+        "session_uuid": details['session_uuid'] if details else None,
+        "topic": details['topic'] if details else "Unknown",
+        "room": details['room'] if details else "Unknown",
+        "subject_code": details['subject_code'] if details else "Unknown",
         "logs": logs
     }
 
 
 # 4. MANUAL OVERRIDE ENDPOINT
 @app.post("/attendance/manual")
-def manual_attendance(update: ManualUpdate):
+def manual_attendance(update: ManualUpdate, current_user: dict = auth.Depends(auth.get_current_user)):
     if ai_system.active_session_id is None:
         raise HTTPException(status_code=400, detail="No active class session.")
 
@@ -359,11 +382,6 @@ def student_self_checkin(payload: StudentCheckIn):
                  raise HTTPException(status_code=403, detail="You are not enrolled in this class.")
 
         # 3. Log Attendance (Status = PRESENT, is_manual = 1)
-        # reusing manual_update_status logic but bypassing name lookup
-        # actually db.manual_update_status takes name. Let's just do direct DB insert or use log_attendance and set manual flag?
-        # log_attendance doesn't set manual flag.
-        # manual_update_status uses name.
-        # Let's just call manual_update_status since we have the name.
         
         success = db.manual_update_status(ai_system.active_session_id, name, "PRESENT")
         
@@ -374,12 +392,10 @@ def student_self_checkin(payload: StudentCheckIn):
              
     finally:
         conn.close()
-    
-    
-# 4.5 EXPORT ENDPOINT
+
 # 4.5 EXPORT ENDPOINT
 @app.get("/export/attendance")
-def export_attendance(subject_id: int = None, professor_id: int = None):
+def export_attendance(subject_id: int = None, professor_id: int = None, current_user: dict = auth.Depends(auth.get_current_user)):
     import pandas as pd
     from io import BytesIO
     
@@ -389,7 +405,6 @@ def export_attendance(subject_id: int = None, professor_id: int = None):
     all_sessions = db.get_all_sessions(professor_id=professor_id, subject_id=subject_id)
     
     # 2. Prepare Lists for Keys
-    # Students
     student_records = []
     for s in all_students:
         student_records.append({'student_code': s['student_code'], 'name': s['name']})
@@ -443,6 +458,27 @@ def export_attendance(subject_id: int = None, professor_id: int = None):
     # 6. Fill Gaps
     pivot_df = pivot_df.fillna('ABSENT')
     
+    # --- ADD SUMMARY COLUMNS (Requirement) ---
+    if not pivot_df.empty:
+        # Count occurrences of 'PRESENT'
+        present_count = (pivot_df == 'PRESENT').sum(axis=1)
+        # Count occurrences of log-like statuses (PRESENT, LATE, etc.)
+        # For simplicity, assuming anything not ABSENT is Present-ish?
+        # Or strict 'PRESENT'. Let's do strict.
+        
+        # Count ABSENT
+        absent_count = (pivot_df == 'ABSENT').sum(axis=1)
+        
+        # Total Sessions (Number of columns effectively)
+        # Note: If a student wasn't enrolled when session happened, logic might be complex.
+        # But here we assume column count = total sessions.
+        total_sessions = len(session_labels)
+        
+        # Insert Columns at Start
+        pivot_df.insert(0, 'Absent', absent_count)
+        pivot_df.insert(0, 'Present', present_count)
+        pivot_df.insert(0, 'Total Sessions', total_sessions)
+    
     # 7. Export
     stream = io.StringIO()
     pivot_df.to_csv(stream)
@@ -452,6 +488,85 @@ def export_attendance(subject_id: int = None, professor_id: int = None):
     response.headers["Content-Disposition"] = f"attachment; filename={filename}"
     
     return response
+
+
+# --- ADVANCED EXPORT API ---
+
+class AdvancedExportRequest(BaseModel):
+    subject_ids: Optional[List[int]] = None
+    rooms: Optional[List[str]] = None
+    professor_ids: Optional[List[int]] = None
+    session_ids: Optional[List[int]] = None
+    student_ids: Optional[List[int]] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    view_mode: str = "CLASS" # "CLASS" or "RAW"
+
+@app.get("/api/export/options")
+async def get_export_options(current_user: dict = auth.Depends(auth.get_current_user)):
+    return db.get_filter_options()
+
+@app.post("/api/export/generate")
+async def generate_advanced_export(req: AdvancedExportRequest, current_user: dict = auth.Depends(auth.get_current_user)):
+    # 1. Get Raw Data from DB
+    filters = req.dict()
+    raw_data = db.get_advanced_export_data(filters)
+    
+    if req.view_mode == "RAW":
+        cols = list(raw_data[0].keys()) if raw_data else []
+        return {"columns": cols, "data": raw_data, "mode": "RAW"}
+    
+    # 2. CLASS VIEW (Pivot Logic)
+    if not raw_data:
+        return {"columns": [], "data": [], "mode": "CLASS"}
+        
+    df = pd.DataFrame(raw_data)
+    
+    # Ensure columns exist (handle empty case)
+    if df.empty:
+         return {"columns": [], "data": [], "mode": "CLASS"}
+
+    # Pivot: Index=[Student], Columns=[Date+Topic], Values=[Status]
+    # We construct a composite column label first?
+    # Or just use Date? User wants "Session Name".
+    # Let's clean up Session Label: "2024-01-01 (Intro)"
+    df['session_label'] = df['session_date'] + ' (' + df['session_topic'] + ')'
+    
+    # Pivot
+    # aggfunc='first' because one student has one status per session
+    pivot_df = df.pivot_table(
+        index=['student_code', 'student_name'],
+        columns='session_label',
+        values='status',
+        aggfunc='first'
+    )
+    
+    # 3. Calculate Stats
+    # Fill NaN with "ABSENT" (Assumption: No log = Absent)
+    pivot_df = pivot_df.fillna("ABSENT")
+    
+    # Count Present (Anything not ABSENT?)
+    # Strict: Status == "PRESENT" or "LATE"?
+    # Let's count "ABSENT" specifically.
+    total_sessions = pivot_df.shape[1]
+    absent_count = (pivot_df == 'ABSENT').sum(axis=1)
+    present_count = total_sessions - absent_count
+    
+    # Flatten Index
+    pivot_df.reset_index(inplace=True)
+    
+    # Add Stat Columns
+    pivot_df.insert(2, 'Total Classes', total_sessions)
+    pivot_df.insert(3, 'Present', present_count.values)
+    pivot_df.insert(4, 'Absent', absent_count.values)
+    
+    # Convert to JSON-friendly dict
+    # orient='records' -> [{col: val, ...}, ...]
+    # We also want column order
+    json_data = pivot_df.to_dict(orient='records')
+    columns = list(pivot_df.columns)
+    
+    return {"columns": columns, "data": json_data, "mode": "CLASS"}
 
 
 
