@@ -94,7 +94,7 @@ class ConfirmPayload(BaseModel):
     token: str
     name: str
     student_code: str
-    class_id: int # NEW
+    class_code: str # NEW
 
 
 # --- ROUTES ---
@@ -215,6 +215,9 @@ def get_recent_sessions(subject_id: int):
 # 2. CONTROL THE CLASS
 @app.post("/start_class")
 def start_class(session: ClassSession, current_user: dict = auth.Depends(auth.get_current_user)):
+    # 0. SANITIZATION: Force Lowercase
+    session.topic = session.topic.lower()
+    
     print(f"🚀 Starting Class: {session.topic} (Code: {session.subject_code})")
     
     # 1. Create Session in DB (Linked to Professor)
@@ -265,18 +268,23 @@ def get_registration_status():
 # --- SUBJECT MANAGEMENT ---
 
 @app.get("/subjects")
-def get_subjects(current_user: dict = auth.Depends(auth.get_current_user)):
+def get_subjects(include_disabled: bool = False, current_user: dict = auth.Depends(auth.get_current_user)):
     conn = db.get_db_connection()
     # Filter by the logged-in professor's ID
-    # Also join with enrollments to get student count
     query = '''
         SELECT s.*, COUNT(e.student_id) as student_count
         FROM subjects s
         LEFT JOIN enrollments e ON s.id = e.subject_id
         WHERE s.professor_id = ?
-        GROUP BY s.id
     '''
-    rows = conn.execute(query, (current_user['id'],)).fetchall()
+    params = [current_user['id']]
+    
+    if not include_disabled:
+        query += " AND s.is_active = 1"
+        
+    query += " GROUP BY s.id"
+    
+    rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
@@ -299,7 +307,13 @@ def create_subject_endpoint(payload: SubjectPayload, current_user: dict = auth.D
         conn.close()
         raise HTTPException(status_code=500, detail=str(e))
     conn.close()
+    conn.close()
     return {"message": "Subject created"}
+
+@app.post("/subjects/{subject_id}/toggle")
+def toggle_subject(subject_id: int, enable: bool, current_user: dict = auth.Depends(auth.get_current_user)):
+    success = db.toggle_subject_status(subject_id, enable)
+    return {"message": "Status updated", "enabled": enable}
 
 @app.post("/enroll")
 def enroll_student(payload: EnrollmentPayload, current_user: dict = auth.Depends(auth.get_current_user)):
@@ -326,7 +340,8 @@ def get_live_attendance(current_user: dict = auth.Depends(auth.get_current_user)
         "topic": details['topic'] if details else "Unknown",
         "room": details['room'] if details else "Unknown",
         "subject_code": details['subject_code'] if details else "Unknown",
-        "logs": logs
+        "logs": logs,
+        "registration_enabled": ai_system.allow_registration
     }
 
 
@@ -532,12 +547,31 @@ async def generate_advanced_export(req: AdvancedExportRequest, current_user: dic
     # Let's clean up Session Label: "2024-01-01 (Intro)"
     df['session_label'] = df['session_date'] + ' (' + df['session_topic'] + ')'
     
-    # Pivot
-    # aggfunc='first' because one student has one status per session
+    # 2.5 CREATE DISPLAY VALUE (Time instead of Status)
+    # We want to show "HH:MM" if status is PRESENT
+    def get_display_value(row):
+        status = row.get('status')
+        check_in = row.get('check_in_time')
+        
+        if status == 'PRESENT' and check_in:
+            # check_in_time is likely "YYYY-MM-DD HH:MM:SS" or just "HH:MM:SS"
+            # We want just HH:MM
+            try:
+                # If it's a full ISO string, parse it. If simple string, slice it.
+                # Assuming standard SQL format "yyyy-mm-dd hh:mm:ss" or "hh:mm:ss"
+                time_part = str(check_in).split(' ')[-1] # Take last part
+                return time_part[:5] # "09:05"
+            except:
+                return status
+        return status
+
+    df['display_value'] = df.apply(get_display_value, axis=1)
+
+    # Pivot with NEW display_value
     pivot_df = df.pivot_table(
         index=['student_code', 'student_name'],
         columns='session_label',
-        values='status',
+        values='display_value', # <--- Changed from 'status'
         aggfunc='first'
     )
     
@@ -545,9 +579,7 @@ async def generate_advanced_export(req: AdvancedExportRequest, current_user: dic
     # Fill NaN with "ABSENT" (Assumption: No log = Absent)
     pivot_df = pivot_df.fillna("ABSENT")
     
-    # Count Present (Anything not ABSENT?)
-    # Strict: Status == "PRESENT" or "LATE"?
-    # Let's count "ABSENT" specifically.
+    # Count Present (Status is not ABSENT)
     total_sessions = pivot_df.shape[1]
     absent_count = (pivot_df == 'ABSENT').sum(axis=1)
     present_count = total_sessions - absent_count
@@ -556,13 +588,11 @@ async def generate_advanced_export(req: AdvancedExportRequest, current_user: dic
     pivot_df.reset_index(inplace=True)
     
     # Add Stat Columns
-    pivot_df.insert(2, 'Total Classes', total_sessions)
+    pivot_df.insert(2, 'Total Session', total_sessions)
     pivot_df.insert(3, 'Present', present_count.values)
     pivot_df.insert(4, 'Absent', absent_count.values)
     
     # Convert to JSON-friendly dict
-    # orient='records' -> [{col: val, ...}, ...]
-    # We also want column order
     json_data = pivot_df.to_dict(orient='records')
     columns = list(pivot_df.columns)
     
@@ -652,8 +682,14 @@ async def register_confirm(payload: ConfirmPayload, background_tasks: Background
     """
     Step 2: Commit payload. using token.
     """
-    # Fix: User AI system's logical commit
-    res = ai_system.commit_registration(payload.token, payload.name, payload.class_id)
+    # Resolve Class Code -> Class ID (For correct folder naming: "6" not "01204200")
+    class_id = db.get_subject_id_by_code(payload.class_code)
+    if not class_id:
+        # Fallback to 0 if not found, but this shouldn't happen with valid codes
+        print(f"⚠️ Class Code {payload.class_code} not found. Defaulting to 0.")
+        class_id = 0
+
+    res = ai_system.commit_registration(payload.token, payload.name, class_id)
     
     if not res["success"]:
         raise HTTPException(status_code=400, detail=res["message"])
@@ -667,7 +703,7 @@ async def register_confirm(payload: ConfirmPayload, background_tasks: Background
     success = db.add_student(payload.student_code, safe_name, file_path)
     
     # AUTO ENROLL TO CLASS
-    # payload.class_id is the database ID (int), so we pass it as subject_id
-    db.enroll_student(payload.student_code, subject_id=payload.class_id)
+    # enroll_student(code, subject_code=...)
+    db.enroll_student(payload.student_code, subject_code=payload.class_code)
     
     return {"status": "success", "message": f"Student {safe_name} registered successfully!"}

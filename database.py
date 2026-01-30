@@ -48,6 +48,7 @@ def init_db(gallery_path="gallery"):
         name TEXT NOT NULL,
         professor_id INTEGER,
         uuid TEXT UNIQUE,
+        is_active BOOLEAN DEFAULT 1,
         FOREIGN KEY (professor_id) REFERENCES professors (id)
     )
     ''')
@@ -66,7 +67,9 @@ def init_db(gallery_path="gallery"):
         is_active BOOLEAN DEFAULT 1,
         uuid TEXT UNIQUE,
         FOREIGN KEY (subject_id) REFERENCES subjects (id),
-        FOREIGN KEY (professor_id) REFERENCES professors (id)
+        FOREIGN KEY (professor_id) REFERENCES professors (id),
+        UNIQUE(subject_id, topic),
+        CHECK(topic = lower(topic))
     )
     ''')
 
@@ -197,10 +200,13 @@ def add_student(student_code, name, image_path):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # Student exists. This is expected for multi-class enrollment.
-        # We might want to update the image path or name?
-        # For now, just return True so flow continues to Enrollment.
-        print(f"ℹ️ Student {student_code} already in DB. Proceeding to enrollment.")
+        # Student exists. UPDATE their info (e.g. new photo, corrected name)
+        conn.execute(
+            'UPDATE students SET name = ?, image_path = ? WHERE student_code = ?',
+            (name, image_path, student_code)
+        )
+        conn.commit()
+        print(f"ℹ️ Student {student_code} updated with new details.")
         return True
     finally:
         conn.close()
@@ -266,11 +272,28 @@ def create_subject(code, name, professor_id=None):
     finally:
         conn.close()
 
+def toggle_subject_status(subject_id, is_active):
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE subjects SET is_active = ? WHERE id = ?', (1 if is_active else 0, subject_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
 def get_subject_by_uuid(uuid_str):
     conn = get_db_connection()
     sub = conn.execute('SELECT * FROM subjects WHERE uuid = ?', (uuid_str,)).fetchone()
     conn.close()
     return sub
+
+def get_subject_id_by_code(code):
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT id FROM subjects WHERE code = ?', (code,)).fetchone()
+        return row['id'] if row else None
+    finally:
+        conn.close()
 
 def enroll_student(student_code, subject_code=None, subject_id=None):
     conn = get_db_connection()
@@ -495,11 +518,20 @@ def manual_update_status(session_id, student_name, status):
 def get_logs_by_session(session_id):
     conn = get_db_connection()
     query = '''
-        SELECT s.name, s.student_code, s.image_path, l.check_in_time, l.status 
+        SELECT 
+            s.name, 
+            s.student_code, 
+            s.image_path, 
+            l.check_in_time, 
+            l.status,
+            COALESCE(
+                (SELECT MAX(timestamp) FROM raw_face_logs r WHERE r.session_id = l.session_id AND r.student_id = s.id),
+                l.check_in_time
+            ) as last_interaction
         FROM attendance_logs l
         JOIN students s ON l.student_id = s.id
         WHERE l.session_id = ?
-        ORDER BY l.check_in_time DESC
+        ORDER BY last_interaction DESC
     '''
     rows = conn.execute(query, (session_id,)).fetchall()
     conn.close()
@@ -755,6 +787,7 @@ def get_live_monitor_data(session_id):
             l.check_in_time,
             l.proof_path,
             (SELECT COUNT(*) FROM raw_face_logs r WHERE r.session_id = ? AND r.student_id = s.id) as detection_count,
+            (SELECT MAX(timestamp) FROM raw_face_logs r WHERE r.session_id = ? AND r.student_id = s.id) as last_seen,
             CASE 
                 WHEN l.status IS NOT NULL THEN l.status
                 ELSE 'ABSENT' 
@@ -766,7 +799,7 @@ def get_live_monitor_data(session_id):
         ORDER BY s.student_code ASC
     '''
     
-    rows = conn.execute(query, (session_id, session_id, subject_id)).fetchall()
+    rows = conn.execute(query, (session_id, session_id, session_id, subject_id)).fetchall()
     conn.close()
     
     students = [dict(row) for row in rows]
