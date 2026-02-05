@@ -116,11 +116,20 @@ def init_db(gallery_path="gallery"):
         UNIQUE(student_id, subject_id)
     )
     ''')
+
+    # 7. MIGRATION: Add is_registration_open to subjects if missing
+    try:
+        cursor.execute("ALTER TABLE subjects ADD COLUMN is_registration_open BOOLEAN DEFAULT 0")
+        print("✅ Migrated: Added is_registration_open to subjects")
+    except Exception:
+        pass # Column likely exists
+
     conn.close()
     print("✅ Database Initialized!")
 
     # Auto Sync on startup
     sync_gallery_to_db(gallery_path)
+
 
 
 def sync_gallery_to_db(gallery_path):
@@ -352,8 +361,9 @@ def create_session(topic=None, subject_code=None, professor_id=None, room=None):
 
     subject_id = None
     if subject_code:
-        # Auto-create subject if passing a code directly (Check if exists first)
-        sid = create_subject(subject_code, subject_code) 
+        # Auto-create subject if passing a code directly
+        # FIX: Pass professor_id so the subject belongs to the creator
+        sid = create_subject(subject_code, subject_code, professor_id) 
         subject_id = sid
 
     if not topic:
@@ -655,11 +665,60 @@ def get_advanced_export_data(filters):
     """
     conn = get_db_connection()
     
-    # Base Query: Get ALL Logs + Session Info + Student Info
-    query = """
+    # 1. First, select the TARGET SESSIONS based on filters
+    # We do this first to keep the main query clean
+    session_filters = []
+    session_params = []
+    
+    if filters.get('start_date'):
+        session_filters.append("ses.date >= ?")
+        session_params.append(filters['start_date'])
+    if filters.get('end_date'):
+        session_filters.append("ses.date <= ?")
+        session_params.append(filters['end_date'])
+    if filters.get('subject_ids'):
+        ids = filters['subject_ids']
+        if ids:
+            placeholders = ','.join('?' * len(ids))
+            session_filters.append(f"ses.subject_id IN ({placeholders})")
+            session_params.extend(ids)
+    if filters.get('professor_ids'):
+        pids = filters['professor_ids']
+        if pids:
+            placeholders = ','.join('?' * len(pids))
+            session_filters.append(f"ses.professor_id IN ({placeholders})")
+            session_params.extend(pids)
+    if filters.get('session_ids'):
+        sids = filters['session_ids']
+        if sids:
+            placeholders = ','.join('?' * len(sids))
+            session_filters.append(f"ses.id IN ({placeholders})")
+            session_params.extend(sids)
+
+    if filters.get('rooms'):
+        r_list = filters['rooms']
+        if r_list:
+            placeholders = ','.join('?' * len(r_list))
+            session_filters.append(f"ses.room IN ({placeholders})")
+            session_params.extend(r_list)
+            
+    where_clause = " AND ".join(session_filters)
+    if where_clause:
+        where_clause = "WHERE " + where_clause
+    else:
+        where_clause = "" # Warning: Selects all sessions if no filter
+        
+    # 2. Main Query: Cross Join Sessions & Enrollments
+    # Structure:
+    #   FROM sessions (Filtered)
+    #   JOIN enrollments (To get expected students for that session)
+    #   JOIN students (To get names)
+    #   LEFT JOIN logs (To get actual status)
+    
+    query = f"""
         SELECT 
             l.id as log_id,
-            l.status,
+            COALESCE(l.status, 'ABSENT') as status,
             l.check_in_time,
             s.student_code,
             s.name as student_name,
@@ -669,74 +728,33 @@ def get_advanced_export_data(filters):
             sub.code as subject_code,
             sub.name as subject_name,
             p.full_name as professor_name
-        FROM attendance_logs l
-        JOIN sessions ses ON l.session_id = ses.id
-        JOIN students s ON l.student_id = s.id
+        FROM sessions ses
+        JOIN enrollments e ON ses.subject_id = e.subject_id
+        JOIN students s ON e.student_id = s.id
         LEFT JOIN subjects sub ON ses.subject_id = sub.id
         LEFT JOIN professors p ON ses.professor_id = p.id
-        WHERE 1=1
+        LEFT JOIN attendance_logs l ON l.session_id = ses.id AND l.student_id = s.id
+        {where_clause}
     """
-    params = []
     
-    # --- DYNAMIC FILTERS ---
+    # 3. Apply Student Filter (If any)
+    # This must be applied AFTER we generated the potential rows, 
+    # effectively filtering the 'students' table.
+    params = session_params # Start with session params
     
-    # 1. Date Range (Inclusive)
-    if filters.get('start_date'):
-        query += " AND ses.date >= ?"
-        params.append(filters['start_date'])
-        
-    if filters.get('end_date'):
-        query += " AND ses.date <= ?"
-        params.append(filters['end_date'])
-        
-    # 2. Subjects (OR List)
-    if filters.get('subject_ids'):
-        ids = filters['subject_ids']
-        if ids:
-            placeholders = ','.join('?' * len(ids))
-            query += f" AND ses.subject_id IN ({placeholders})"
-            params.extend(ids)
-            
-    # 3. Rooms (OR List)
-    if filters.get('rooms'):
-        rooms = filters['rooms']
-        if rooms:
-            placeholders = ','.join('?' * len(rooms))
-            query += f" AND ses.room IN ({placeholders})"
-            params.extend(rooms)
-
-    # 4. Professors (OR List)
-    if filters.get('professor_ids'):
-        pids = filters['professor_ids']
-        if pids:
-            placeholders = ','.join('?' * len(pids))
-            query += f" AND ses.professor_id IN ({placeholders})"
-            params.extend(pids)
-
-    # 5. Specific Sessions (OR List)
-    if filters.get('session_ids'):
-        sids = filters['session_ids']
-        if sids:
-            placeholders = ','.join('?' * len(sids))
-            query += f" AND ses.id IN ({placeholders})"
-            params.extend(sids)
-
-    # 6. Specific Students (OR List)
     if filters.get('student_ids'):
         st_ids = filters['student_ids']
         if st_ids:
             placeholders = ','.join('?' * len(st_ids))
-            query += f" AND l.student_id IN ({placeholders})"
+            query += f" AND s.id IN ({placeholders})"
             params.extend(st_ids)
-
+            
     query += " ORDER BY ses.date ASC, ses.start_time ASC, s.student_code ASC"
-    
+
     # Execute
     rows = conn.execute(query, params).fetchall()
     conn.close()
     
-    # Return List of Dicts (Raw Data)
-    # The 'Class View' pivot logic will be handled by the API/Pandas to keep SQL simple.
     return [dict(row) for row in rows]
 
 def get_all_sessions(professor_id=None, subject_id=None):
@@ -817,6 +835,31 @@ def get_session_details(session_id):
         JOIN subjects sub ON s.subject_id = sub.id
         WHERE s.id = ?
     ''', (session_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# --- SUBJECT REGISTRATION HELPERS ---
+def toggle_subject_registration(subject_id, enable):
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE subjects SET is_registration_open = ? WHERE id = ?', (1 if enable else 0, subject_id))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+def get_subject_by_id(subject_id):
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM subjects WHERE id = ?', (subject_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def get_subject_by_code(code):
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM subjects WHERE code = ?', (code,)).fetchone()
     conn.close()
     return dict(row) if row else None
 

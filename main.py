@@ -11,6 +11,7 @@ import time
 import io
 import pandas as pd
 from typing import List, Optional
+import socket
 
 # --- CUSTOM MODULES ---
 # import core_AI
@@ -98,6 +99,23 @@ class ConfirmPayload(BaseModel):
 
 
 # --- ROUTES ---
+
+@app.get("/system/ip")
+def get_system_ip():
+    """
+    Returns the host's primary LAN IP Address (e.g., 192.168.1.5).
+    """
+    try:
+        # Trick: connect to a public DNS (doesn't actually send data) to find the routing IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0)
+        s.connect(('8.8.8.8', 1)) 
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = "127.0.0.1" # Fallback
+    
+    return {"ip": ip}
 
 @app.get("/")
 def read_root():
@@ -254,15 +272,24 @@ def end_class(current_user: dict = auth.Depends(auth.get_current_user)):
     return {"message": "Class ended"}
     
 @app.post("/session/toggle_registration")
-def toggle_registration(enable: bool, current_user: dict = auth.Depends(auth.get_current_user)):
-    ai_system.allow_registration = enable
+def toggle_registration(subject_id: int, enable: bool, current_user: dict = auth.Depends(auth.get_current_user)):
+    # Update DB
+    success = db.toggle_subject_registration(subject_id, enable)
+    
+    # Also update global gate for backward compatibility/AI system safety
+    # We might need to handle how AI system checks allow_registration.
+    # Ideally AI system should check subject_id.
+    # For now, let's keep ai_system.allow_registration as a "Global Gate" that is True if *any* class is open?
+    # Or just remove it and rely on the validate_registration endpoint checking DB.
+    # Let's set it to True if enable=True, but this is a rough patch.
+    if enable: 
+        ai_system.allow_registration = True
+    
     status = "Enabled" if enable else "Disabled"
-    print(f"🔓 Registration {status}")
-    return {"message": f"Registration {status}", "enabled": enable}
+    print(f"🔓 Registration {status} for Subject {subject_id}")
+    return {"message": f"Registration {status}", "enabled": enable, "subject_id": subject_id}
 
-@app.get("/session/registration_status")
-def get_registration_status():
-    return {"enabled": ai_system.allow_registration}
+
     
     
 # --- SUBJECT MANAGEMENT ---
@@ -272,7 +299,7 @@ def get_subjects(include_disabled: bool = False, current_user: dict = auth.Depen
     conn = db.get_db_connection()
     # Filter by the logged-in professor's ID
     query = '''
-        SELECT s.*, COUNT(e.student_id) as student_count
+        SELECT s.*, COUNT(e.student_id) as student_count, s.is_registration_open
         FROM subjects s
         LEFT JOIN enrollments e ON s.id = e.subject_id
         WHERE s.professor_id = ?
@@ -315,13 +342,6 @@ def toggle_subject(subject_id: int, enable: bool, current_user: dict = auth.Depe
     success = db.toggle_subject_status(subject_id, enable)
     return {"message": "Status updated", "enabled": enable}
 
-@app.post("/enroll")
-def enroll_student(payload: EnrollmentPayload, current_user: dict = auth.Depends(auth.get_current_user)):
-    success, msg = db.enroll_student(payload.student_code, payload.subject_code)
-    if not success:
-        raise HTTPException(status_code=400, detail=msg)
-    return {"message": msg}
-
 
 # 3. DATA FOR DASHBOARD
 @app.get("/attendance/live")
@@ -339,6 +359,7 @@ def get_live_attendance(current_user: dict = auth.Depends(auth.get_current_user)
         "session_uuid": details['session_uuid'] if details else None,
         "topic": details['topic'] if details else "Unknown",
         "room": details['room'] if details else "Unknown",
+        "date": details['date'] if details else None,
         "subject_code": details['subject_code'] if details else "Unknown",
         "logs": logs,
         "registration_enabled": ai_system.allow_registration
@@ -601,66 +622,26 @@ async def generate_advanced_export(req: AdvancedExportRequest, current_user: dic
 
 
 
-# 5. REGISTRATION ENDPOINT (UPDATED FOR PYTORCH)
-@app.post("/register_student")
-async def register_student(
-        name: str = Form(...),
-        student_code: str = Form(...),
-        file: UploadFile = File(...),
-        background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    # 1. READ IMAGE
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file.")
-
-    # 2. VALIDATE FACE (Using YOLO instead of DeepFace)
-    # This server-side check prevents saving bad images
-    try:
-        results = ai_system.detector.predict(img, verbose=False, conf=0.5, device='cpu')
-        # Check if any face boxes were detected
-        if not results or not results[0].boxes:
-            raise ValueError("No face")
-    except Exception:
-        raise HTTPException(status_code=400, detail="No face detected. Please take a clearer photo.")
-
-    # 3. SAVE TO GALLERY
-    # Create clean filename (e.g. "Chanon_S.jpg")
-    safe_name = "".join(x for x in name if x.isalnum() or x in " _-").strip()
-    if not os.path.exists("gallery"):
-        os.makedirs("gallery")
-
-    file_path = f"gallery/{safe_name}.jpg"
-    cv2.imwrite(file_path, img)
-
-    # 4. SAVE TO DATABASE
-    success = db.add_student(student_code, safe_name, file_path)
-    if not success:
-        # If DB fails (duplicate ID), delete the photo to avoid junk files
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=400, detail="Student ID already exists.")
-
-    # 5. RE-SYNC AI (Background Task)
-    # This prevents the video feed from freezing while the AI re-learns
-    print(f"🔄 Queued background indexing for {safe_name}...")
-    background_tasks.add_task(ai_system.reload_database)
-
-    return {"status": "success", "message": f"Student {safe_name} registered! AI is updating..."}
+# LEGACY REGISTRATION REMOVED
+# Use /register/validate and /register/confirm instead
 
 
 # 6. NEW STAGED REGISTRATION (Better Logic)
 @app.post("/register/validate")
-async def register_validate(file: UploadFile = File(...)):
+async def register_validate(class_code: str = Form(...), file: UploadFile = File(...)):
     """
     Step 1: Upload photo. check quality. get token + preview.
     """
-    # 0. Check Gate
-    if not ai_system.allow_registration:
-        raise HTTPException(status_code=403, detail="Registration is currently closed by the Professor.")
+    # 0. Check Gate (Subject Specific)
+    subj = db.get_subject_by_code(class_code)
+    if not subj:
+         # Fallback: legacy check
+         if not ai_system.allow_registration:
+             raise HTTPException(status_code=403, detail="Class not found or closed.")
+    else:
+        # Check DB Status
+        if not subj['is_registration_open'] and not ai_system.allow_registration:
+             raise HTTPException(status_code=403, detail=f"Registration for {subj['code']} is closed.")
 
     try:
         contents = await file.read()

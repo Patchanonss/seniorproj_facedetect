@@ -113,10 +113,10 @@ class FaceAnalyzer:
         1. Blur (Laplacian var)
         2. Face Count (Must be 1)
         3. Pose (Yaw/Roll using Keypoints)
-        Returns: (is_valid, reason, face_crop)
+        Returns: (is_valid, reason, face_crop, kpts_relative)
         """
         if img_bgr is None:
-            return False, "No image provided", None
+            return False, "No image provided", None, None
 
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         
@@ -124,7 +124,7 @@ class FaceAnalyzer:
         blur_var = cv2.Laplacian(gray, cv2.CV_64F).var()
         print(f"🔍 DEBUG: Blur Var: {blur_var:.2f}")
         if blur_var < 80:  # BALANCED (Was 100, formerly 50)
-            return False, f"Image is too blurry ({blur_var:.1f}). Hold steady & tap to focus.", None
+            return False, f"Image is too blurry ({blur_var:.1f}). Hold steady & tap to focus.", None, None
 
         # 2. RUN DETECTION (Use VALIDATOR)
         # We are in the API thread here, so we should use VALIDATOR to avoid race with TRACKER in detection thread
@@ -132,12 +132,12 @@ class FaceAnalyzer:
         
         if not results or not results[0].boxes:
             print("🔍 DEBUG: No face detected.")
-            return False, "No face detected.", None
+            return False, "No face detected.", None, None
             
         boxes = results[0].boxes
         if len(boxes) > 1:
             print(f"🔍 DEBUG: Faces found: {len(boxes)}")
-            return False, "Multiple faces detected. Please be alone.", None
+            return False, "Multiple faces detected. Please be alone.", None, None
             
         # 3. EXTRACT FACE & KEYPOINTS
         box = boxes[0]
@@ -147,7 +147,7 @@ class FaceAnalyzer:
         
         # SIZE CHECK (NEW - Relaxed)
         if w < 100 or h < 100:
-             return False, "Face too small/far. Move closer.", None
+             return False, "Face too small/far. Move closer.", None, None
 
         face_crop = img_bgr[max(0, y1):min(img_bgr.shape[0], y2),
                             max(0, x1):min(img_bgr.shape[1], x2)]
@@ -160,7 +160,7 @@ class FaceAnalyzer:
                  conf = results[0].keypoints.conf[0].cpu().numpy()
                  print(f"🔍 DEBUG: Keypoint Conf: {conf.mean():.2f}")
                  if conf.mean() < 0.3:
-                      return False, "Face not clear enough (low keypoint confidence).", None
+                      return False, "Face not clear enough (low keypoint confidence).", None, None
 
              kpts = results[0].keypoints.xy[0].cpu().numpy()
              if len(kpts) >= 3:
@@ -172,7 +172,7 @@ class FaceAnalyzer:
                  angle = np.degrees(np.arctan2(dy, dx))
                  print(f"🔍 DEBUG: Head Tilt: {angle:.2f}")
                  if abs(angle) > 25: # Relaxed from 15
-                     return False, "Head tilted. Please keep head straight.", None
+                     return False, "Head tilted. Please keep head straight.", None, None
                      
                  # B. YAW (Turn) - Distance from Nose to Eyes
                  nose = kpts[2]
@@ -186,9 +186,16 @@ class FaceAnalyzer:
                      # Frontal face should have ratio close to 1.0. 
                      # Side face will have large ratio.
                      if ratio > 4.0: # Relaxed from 2.0
-                         return False, "Face turned. Please look straight at camera.", None
+                         return False, "Face turned. Please look straight at camera.", None, None
 
-        return True, "Quality OK", face_crop
+        # Prepare Relative Keypoints for Alignment
+        kpts_relative = None
+        if 'kpts' in locals():
+            kpts_relative = kpts.copy()
+            kpts_relative[:, 0] -= x1
+            kpts_relative[:, 1] -= y1
+
+        return True, "Quality OK", face_crop, kpts_relative
 
 
 # ==========================================
@@ -212,11 +219,7 @@ class FaceDatabase:
         Loads gallery images for a SPECIFIC CLASS.
         Structure: gallery/{class_id}/vectors/{name}.pt
         """
-        if not class_id_or_code:
-            print("⚠️ No Class ID provided. Clearing memory.")
-            self.face_db_embeddings = []
-            self.face_db_names = []
-            return
+
 
         target_dir = os.path.join(self.DB_PATH, str(class_id_or_code))
         vectors_dir = os.path.join(target_dir, "vectors")
@@ -231,24 +234,7 @@ class FaceDatabase:
         # -----------------------------------------------
         # MIGRATION: Split Legacy vectors.pt -> vectors/*.pt
         # -----------------------------------------------
-        if os.path.exists(legacy_cache_path):
-            print("📦 Found legacy monolithic cache. Migrating to granular files...")
-            try:
-                if not os.path.exists(vectors_dir):
-                     os.makedirs(vectors_dir)
-                     
-                legacy_data = torch.load(legacy_cache_path)
-                for name, embedding in legacy_data.items():
-                    safe_path = os.path.join(vectors_dir, f"{name}.pt")
-                    torch.save(embedding, safe_path)
-                    print(f"   -> Migrated {name}")
-                
-                # Backup and remove legacy
-                os.rename(legacy_cache_path, legacy_cache_path + ".bak")
-                print("✅ Migration complete. Legacy cache backed up.")
-            except Exception as e:
-                print(f"⚠️ Migration failed: {e}")
-        # -----------------------------------------------
+
 
         if not os.path.exists(vectors_dir):
             os.makedirs(vectors_dir)
@@ -257,20 +243,7 @@ class FaceDatabase:
         gallery_images = glob.glob(os.path.join(target_dir, "*.jpg"))
         gallery_images += glob.glob(os.path.join(target_dir, "*.png"))
         
-        # --- FORCED REFRESH FOR NEW ALIGNMENT SYSTEM ---
-        # We want to rebuild textures once to ensure accuracy.
-        # Simple Logic: If vectors exist but we want to force, we could check a "version" flag.
-        # For now, let's just Log it. The user has been warned that they might need to clear.
-        # Actually, let's just CLEAR it if it's the first time running this new code.
-        # But I don't have persistent state here.
-        # Aggressive Strategy: If the number of vectors matches images, we usually skip.
-        # I will assume the USER will manually clear or I will rely on `loaded_count` logs.
-        # BETTER: Let's just check if we can add a 'force=True' arg to this function?
-        # The calling code doesn't pass it.
-        # Safe strategy: Regenerate only if missing. 
-        # But wait, existing vectors ARE VALID bits, just poorly aligned.
-        # I will delete the "vectors" folder contents inside the loop if I want to force.
-        # OK, I will just proceed with standard lazy loading but add a print:
+        # Lazy Load: Only regenerate if missing.
         print("ℹ️ Note: To apply improved accuracy, please delete the 'vectors' folder in gallery manually if issues persist.") 
         
         new_names = []
@@ -466,14 +439,16 @@ class RegistrationManager:
         Checks quality, doubles check dupes, generates temp key.
         Returns dict with status.
         """
-        valid, reason, face_crop = face_analyzer.check_face_quality(img_bgr)
+        # Updated to receive keypoints
+        valid, reason, face_crop, kpts = face_analyzer.check_face_quality(img_bgr)
         
         if not valid:
             return {"status": "error", "reason": reason}
             
         # 5. DUPLICATE CHECK (Using Embedding)
         face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-        embedding = face_analyzer.get_embedding(face_rgb)
+        # Pass Keypoints for Alignment!
+        embedding = face_analyzer.get_embedding(face_rgb, kpts)
         
         warning = ""
         
@@ -666,12 +641,13 @@ class AICameraSystem:
             
     # --- DELEGATED METHODS ---
     def validate_and_stage(self, img_bgr):
-        return self.registrar.validate_and_stage(img_bgr, self.analyzer, self.face_db)
+        with self.db_lock:
+            # FIX: Unpack 4 values now
+            return self.registrar.validate_and_stage(img_bgr, self.analyzer, self.face_db)
 
     def commit_registration(self, token, name, class_id):
-        result = self.registrar.commit_registration(token, name, self.face_db, class_id)
-        if result["success"]:
-             self.threads_started = False # Why? maybe to reset?
+        with self.db_lock:
+            result = self.registrar.commit_registration(token, name, self.face_db, class_id)
         return result
 
     # --- THREAD MANAGEMENT ---
@@ -730,7 +706,9 @@ class AICameraSystem:
                 face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
                 target_embedding = self.analyzer.get_embedding(face_rgb, keypoints=kpts_for_align)
                 
-                name, score_str = self.face_db.get_match(target_embedding)
+                # FIX: Prevent Race Condition with Reload
+                with self.db_lock:
+                    name, score_str = self.face_db.get_match(target_embedding)
 
                 # DEBUG: Check Alignment & Norm
                 is_aligned_live = "Aligned" if kpts_for_align else "Unaligned"
