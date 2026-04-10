@@ -1,0 +1,21 @@
+# System/IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Data/Runtime
+attendance.db
+*.log
+
+# Project Specific Strings
+gallery/
+proofs/
+
+# Models
+*.mlpackage
